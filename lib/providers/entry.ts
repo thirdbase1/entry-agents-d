@@ -5,7 +5,7 @@ import { isAbsolute, resolve } from "node:path"
 import { exec } from "node:child_process"
 import { promisify } from "node:util"
 
-import type { ModelOption } from "@/components/ui/model-picker"
+import type { ModelOption, ModelPickerGroup } from "@/components/ui/model-picker"
 import type {
   AgentProvider,
   AgentRunOptions,
@@ -16,15 +16,80 @@ import type {
 import type { AppSettings, EntrySettings } from "@/lib/settings/schema"
 import { withPromptContext } from "@/lib/providers/system-prefix"
 import { LineBuffer } from "@/lib/stream-framing"
-import { getDeviceAuthService } from "@/lib/auth/device-auth"
+import { getDeviceAuthService, DEFAULT_ENTRY_URL } from "@/lib/auth/device-auth"
 
 const execAsync = promisify(exec)
 
 export const ENTRY_PROVIDER_ID = "entry"
 
-const DEFAULT_GATEWAY_URL = "https://entry-agents.dev"
+const DEFAULT_GATEWAY_URL = DEFAULT_ENTRY_URL
 
 const PERMISSION_MODES: PermissionMode[] = ["read-only", "plan", "edits", "full"]
+
+/** Well-known provider prefixes for flat model catalog IDs returned by Gateway */
+const FLAT_MODEL_ID_PREFIXES: [prefix: string, provider: string][] = [
+  ["grok", "xai"],
+  ["kimi", "moonshot"],
+  ["mimo", "xiaomi"],
+  ["ling", "ling"],
+  ["hy3", "hy3"],
+  ["qwen", "qwen"],
+  ["minimax", "minimax"],
+  ["step", "stepfun"],
+  ["deepseek", "deepseek"],
+  ["claude", "anthropic"],
+  ["sonnet", "anthropic"],
+  ["opus", "anthropic"],
+  ["haiku", "anthropic"],
+  ["gpt-", "openai"],
+  ["o1", "openai"],
+  ["o3", "openai"],
+  ["gemini", "google"],
+  ["gemma", "google"],
+  ["glm", "zai"],
+  ["mistral", "mistral"],
+  ["codestral", "mistral"],
+  ["llama", "meta"],
+  ["command", "cohere"],
+  ["groq", "groq"],
+]
+
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  google: "Google",
+  xai: "xAI",
+  groq: "Groq",
+  mistral: "Mistral",
+  deepseek: "DeepSeek",
+  perplexity: "Perplexity",
+  moonshot: "Moonshot",
+  together: "Together AI",
+  cohere: "Cohere",
+  fireworks: "Fireworks",
+  meta: "Meta",
+  zai: "ZAI",
+  xiaomi: "Xiaomi",
+  qwen: "Qwen",
+  minimax: "MiniMax",
+  stepfun: "StepFun",
+}
+
+export function getProviderFromModelId(modelId: string): string {
+  const slashIndex = modelId.indexOf("/")
+  if (slashIndex !== -1) {
+    const raw = modelId.slice(0, slashIndex).toLowerCase()
+    return raw === "meta-llama" ? "meta" : raw
+  }
+
+  const lower = modelId.toLowerCase()
+  for (const [prefix, provider] of FLAT_MODEL_ID_PREFIXES) {
+    if (lower.startsWith(prefix) || lower.includes(`-${prefix}`) || lower.includes(`/${prefix}`)) {
+      return provider
+    }
+  }
+  return "openai"
+}
 
 /** Cached models dynamically retrieved from the Gateway */
 let gatewayModelsCache: ModelOption[] | null = null
@@ -395,12 +460,13 @@ export function createEntryProvider(
               const mapped: ModelOption[] = rawModels.map((m) => {
                 const ctx = m.context_window || (m as { contextLength?: number }).contextLength || 1_000_000
                 const ctxLabel = ctx >= 1_000_000 ? `${(ctx / 1_000_000).toFixed(0)}M` : `${Math.round(ctx / 1000)}k`
+                const provider = m.owned_by || getProviderFromModelId(m.id)
                 return {
                   id: m.id,
                   name: m.name ? `${m.name} (${ctxLabel} ctx)` : `${m.id} (${ctxLabel} ctx)`,
                   description: `${m.name || m.id} · ${ctxLabel} context window`,
                   contextLength: ctx,
-                  group: m.owned_by || "entry",
+                  group: provider,
                 }
               })
               gatewayModelsCache = mapped
@@ -428,6 +494,27 @@ export function createEntryProvider(
     async visionModels(): Promise<string[]> {
       const models = await this.listModels()
       return models.map((m) => m.id)
+    },
+
+    async listModelGroups(): Promise<ModelPickerGroup[]> {
+      const models = await this.listModels()
+      const providerSet = new Set<string>()
+      for (const m of models) {
+        if (m.group) providerSet.add(m.group)
+      }
+      const priority = ["anthropic", "openai", "google", "deepseek", "meta", "xai", "mistral", "qwen"]
+      const sorted = Array.from(providerSet).sort((a, b) => {
+        const aIdx = priority.indexOf(a)
+        const bIdx = priority.indexOf(b)
+        if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx
+        if (aIdx !== -1) return -1
+        if (bIdx !== -1) return 1
+        return a.localeCompare(b)
+      })
+      return sorted.map((p) => ({
+        id: p,
+        label: PROVIDER_DISPLAY_NAMES[p] || (p.charAt(0).toUpperCase() + p.slice(1)),
+      }))
     },
 
     async *run(options: AgentRunOptions): AsyncGenerator<AgentStreamEvent> {

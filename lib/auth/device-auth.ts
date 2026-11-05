@@ -1,31 +1,20 @@
 /**
  * Entry Agents Desktop - Device Authorization & Session Management
  *
- * Implements the official Entry device authorization flow:
- * 1. POST /api/desktop/device/start -> gets device_code, code, expires_at
+ * Exclusively uses the official Entry Web backend at https://entry-agents.dev:
+ * 1. POST /api/desktop/device/start -> gets device_code, code, verification_uri_complete
  * 2. User approves in browser at https://entry-agents.dev/desktop/approve?code=XXXXXX
  * 3. POST /api/desktop/device/poll -> polls until approved or expired
- * 4. GET /api/desktop/usage -> loads real account profile & credit balance
+ * 4. GET /api/desktop/usage -> loads account profile and credit balance
  * 5. Securely stores session in OsCredentialStore (Windows DPAPI, macOS Keychain, Linux secret-tool)
  */
 
 import { OsCredentialStore, StoredCredentials } from "./credential-store";
 
-export const DEFAULT_ENTRY_WEB_URL =
+export const DEFAULT_ENTRY_URL =
   process.env.NEXT_PUBLIC_ENTRY_URL ??
   process.env.ENTRY_URL ??
   "https://entry-agents.dev";
-
-export const DEFAULT_ENTRY_BACKEND_URL =
-  process.env.NEXT_PUBLIC_ENTRY_BACKEND_URL ??
-  process.env.ENTRY_BACKEND_URL ??
-  "https://entry-project-b.vercel.app";
-
-export const BACKEND_URLS = [
-  DEFAULT_ENTRY_BACKEND_URL,
-  "https://entry-desktop-backend.vercel.app",
-  DEFAULT_ENTRY_WEB_URL,
-];
 
 export interface DeviceAuthorizeResponse {
   device_code: string;
@@ -56,138 +45,111 @@ export interface DeviceTokenPollResult {
 }
 
 export class EntryDeviceAuthService {
-  backendUrl: string;
-  readonly webUrl: string;
+  readonly baseUrl: string;
   readonly credentialStore: OsCredentialStore;
   private currentAccount: AccountProfile | null = null;
 
   constructor(
-    backendUrl: string = DEFAULT_ENTRY_BACKEND_URL,
-    webUrlOrStore?: string | OsCredentialStore,
-    maybeStore?: OsCredentialStore
+    baseUrl: string = DEFAULT_ENTRY_URL,
+    credentialStore?: OsCredentialStore
   ) {
-    let resolvedWebUrl = DEFAULT_ENTRY_WEB_URL;
-    let resolvedStore: OsCredentialStore | undefined;
-
-    if (typeof webUrlOrStore === "string") {
-      resolvedWebUrl = webUrlOrStore;
-      resolvedStore = maybeStore;
-    } else if (webUrlOrStore instanceof OsCredentialStore) {
-      resolvedStore = webUrlOrStore;
-    }
-
-    this.backendUrl = (backendUrl || DEFAULT_ENTRY_BACKEND_URL).replace(/\/$/, "");
-    this.webUrl = (resolvedWebUrl || DEFAULT_ENTRY_WEB_URL).replace(/\/$/, "");
-    this.credentialStore = resolvedStore ?? new OsCredentialStore();
+    this.baseUrl = (baseUrl || DEFAULT_ENTRY_URL).replace(/\/+$/, "");
+    this.credentialStore = credentialStore ?? new OsCredentialStore();
   }
 
   /**
-   * Initiates the device authorization flow by calling the Entry desktop backend.
+   * Initiates the device authorization flow by calling the Entry backend on entry-agents.dev.
    */
   async startDeviceAuthorization(): Promise<DeviceAuthorizeResponse> {
-    let lastError = "Failed to connect to Entry authentication service";
+    const url = `${this.baseUrl}/api/desktop/device/start`;
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: "entry-desktop" }),
+      });
 
-    for (const backendUrl of BACKEND_URLS) {
-      try {
-        const res = await fetch(`${backendUrl}/api/desktop/device/start`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ client_id: "entry-desktop" }),
-        });
-
-        if (!res.ok) {
-          lastError = `HTTP ${res.status} from ${backendUrl}/api/desktop/device/start`;
-          continue;
-        }
-
-        const data = await res.json();
-        const code = data.code ?? data.user_code ?? data.userCode;
-        const deviceCode = data.device_code ?? data.deviceCode;
-
-        if (!code || !deviceCode) {
-          lastError = "Invalid response from device authorization endpoint";
-          continue;
-        }
-
-        // Lock in the active backend URL that successfully issued the code
-        this.backendUrl = backendUrl;
-
-        const webBase = this.webUrl;
-        return {
-          device_code: deviceCode,
-          user_code: code,
-          code,
-          verification_uri: `${webBase}/desktop/approve`,
-          verification_uri_complete: `${webBase}/desktop/approve?code=${encodeURIComponent(code)}`,
-          expires_in: data.expires_in ?? data.expiresIn ?? 600,
-          interval: data.interval ?? data.poll_interval_seconds ?? 3,
-        };
-      } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} from ${url}`);
       }
-    }
 
-    throw new Error(lastError);
+      const data = await res.json();
+      const code = data.code ?? data.user_code ?? data.userCode;
+      const deviceCode = data.device_code ?? data.deviceCode;
+
+      if (!code || !deviceCode) {
+        throw new Error("Invalid response from device authorization endpoint");
+      }
+
+      const webBase = this.baseUrl;
+      return {
+        device_code: deviceCode,
+        user_code: code,
+        code,
+        verification_uri: data.verification_uri ?? `${webBase}/desktop/approve`,
+        verification_uri_complete:
+          data.verification_uri_complete ??
+          `${webBase}/desktop/approve?code=${encodeURIComponent(code)}`,
+        expires_in: data.expires_in ?? data.expiresIn ?? 600,
+        interval: data.interval ?? data.poll_interval_seconds ?? 3,
+      };
+    } catch (err) {
+      throw new Error(err instanceof Error ? err.message : String(err));
+    }
   }
 
   /**
    * Polls the device token endpoint until approved, pending, or expired.
    */
   async pollDeviceToken(deviceCode: string): Promise<DeviceTokenPollResult> {
-    const pollEndpoints = [
-      `${this.backendUrl}/api/desktop/device/poll`,
-      `${DEFAULT_ENTRY_BACKEND_URL}/api/desktop/device/poll`,
-    ];
+    const url = `${this.baseUrl}/api/desktop/device/poll`;
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          device_code: deviceCode,
+          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+          client_id: "entry-desktop",
+        }),
+      });
 
-    for (const url of pollEndpoints) {
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            device_code: deviceCode,
-            grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-            client_id: "entry-desktop",
-          }),
-        });
-
-        if (!res.ok && res.status !== 400 && res.status !== 404) {
-          continue;
-        }
-
-        const data = await res.json().catch(() => ({}));
-
-        if (data.status === "expired" || data.error === "expired_token") {
-          return { status: "expired", error: "Device authorization code expired" };
-        }
-
-        if (data.status === "pending" || data.error === "authorization_pending") {
-          return { status: "pending" };
-        }
-
-        const token = data.session_token ?? data.access_token;
-        if (token && (data.status === "approved" || data.user_id)) {
-          // Fetch real profile & balance using this session token
-          const profile = await this.fetchAccountProfile(token).catch(() => ({
-            userId: data.user_id ?? "user",
-            email: data.email ?? "user@entry-agents.dev",
-            plan: "free",
-            planName: "Entry Free",
-            creditBalanceCents: 0,
-          }));
-
-          // Save securely to OS Credential Store
-          this.saveSession(token, profile);
-
-          return {
-            status: "approved",
-            session_token: token,
-            account: profile,
-          };
-        }
-      } catch {
-        // try next endpoint
+      if (!res.ok && res.status !== 400 && res.status !== 404) {
+        return { status: "pending" };
       }
+
+      const data = await res.json().catch(() => ({}));
+
+      if (data.status === "expired" || data.error === "expired_token") {
+        return { status: "expired", error: "Device authorization code expired" };
+      }
+
+      if (data.status === "pending" || data.error === "authorization_pending") {
+        return { status: "pending" };
+      }
+
+      const token = data.session_token ?? data.access_token;
+      if (token && (data.status === "approved" || data.user_id)) {
+        // Fetch real profile & balance using this session token
+        const profile = await this.fetchAccountProfile(token).catch(() => ({
+          userId: data.user_id ?? "user",
+          email: data.email ?? "user@entry-agents.dev",
+          plan: "free",
+          planName: "Entry Free",
+          creditBalanceCents: 0,
+        }));
+
+        // Save securely to OS Credential Store
+        this.saveSession(token, profile);
+
+        return {
+          status: "approved",
+          session_token: token,
+          account: profile,
+        };
+      }
+    } catch {
+      // transient network error, keep pending
     }
 
     return { status: "pending" };
@@ -197,13 +159,12 @@ export class EntryDeviceAuthService {
    * Fetches account profile and credits using Bearer session token from /api/desktop/usage.
    */
   async fetchAccountProfile(token: string): Promise<AccountProfile> {
-    const profileUrls = [
-      `${this.backendUrl}/api/desktop/usage`,
-      `${DEFAULT_ENTRY_BACKEND_URL}/api/desktop/usage`,
-      `${this.webUrl}/api/billing/me`,
+    const urls = [
+      `${this.baseUrl}/api/desktop/usage`,
+      `${this.baseUrl}/api/billing/me`,
     ];
 
-    for (const url of profileUrls) {
+    for (const url of urls) {
       try {
         const res = await fetch(url, {
           headers: {
@@ -252,7 +213,7 @@ export class EntryDeviceAuthService {
       accessToken: token,
       refreshToken: token,
       tokenExpiry: Date.now() + 30 * 24 * 60 * 60 * 1000,
-      baseUrl: this.backendUrl,
+      baseUrl: this.baseUrl,
     });
   }
 
