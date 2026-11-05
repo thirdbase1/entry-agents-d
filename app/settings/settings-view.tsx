@@ -13,6 +13,7 @@ import {
   SquareTerminal,
   Palette,
   Search,
+  User,
   type LucideIcon,
 } from "lucide-react"
 
@@ -29,9 +30,11 @@ import { MemorySection } from "./memory-section"
 import { ModelProvidersSection } from "./model-providers-section"
 import { ProvidersSection } from "./providers-section"
 import { UsageSection } from "./usage-section"
+import { AccountSection } from "./account-section"
 import { useAppSettings } from "./use-app-settings"
 
 export type SettingsSectionId =
+  | "account"
   | "appearance"
   | "chat"
   | "providers"
@@ -54,6 +57,17 @@ type SettingsGroup = {
 }
 
 const SECTION_GROUPS: SettingsGroup[] = [
+  {
+    label: "Account",
+    sections: [
+      {
+        id: "account",
+        label: "Entry Account",
+        icon: User,
+        keywords: "entry account profile plan credits balance subscription sign out user",
+      },
+    ],
+  },
   {
     label: "Preferences",
     sections: [
@@ -423,6 +437,7 @@ export function SettingsView({
                 </button>
               </div>
             ) : null}
+            {active === "account" ? <AccountSection /> : null}
             {active === "appearance" ? <AppearanceSection /> : null}
             {!settings.loadError ? (
               <>

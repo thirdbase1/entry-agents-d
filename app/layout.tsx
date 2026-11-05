@@ -11,6 +11,8 @@ import {
   themePresetCss,
 } from "@/lib/theme/apply"
 import { AppearanceProvider } from "@/lib/theme/theme-client"
+import { AuthProvider } from "@/app/hooks/use-auth"
+import { AuthBarrier } from "@/components/auth/auth-barrier"
 import { cn } from "@/lib/utils"
 
 import { themeFontClassName } from "./fonts"
@@ -68,7 +70,11 @@ export default function RootLayout({
               lib/theme/apply.ts, and pre-paint by the bootstrap script) to
               scale their own content. */}
           <div className="h-full [zoom:var(--ui-scale,1)]">
-            <AppearanceProvider>{children}</AppearanceProvider>
+            <AppearanceProvider>
+              <AuthProvider>
+                <AuthBarrier>{children}</AuthBarrier>
+              </AuthProvider>
+            </AppearanceProvider>
           </div>
         </ThemeProvider>
         {/* Toasts wear the app's own theme, not sonner's stock palette: the

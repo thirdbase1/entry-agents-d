@@ -16,6 +16,7 @@ import type {
 import type { AppSettings, EntrySettings } from "@/lib/settings/schema"
 import { withPromptContext } from "@/lib/providers/system-prefix"
 import { LineBuffer } from "@/lib/stream-framing"
+import { getDeviceAuthService } from "@/lib/auth/device-auth"
 
 const execAsync = promisify(exec)
 
@@ -311,10 +312,13 @@ export function createEntryProvider(
     DEFAULT_GATEWAY_URL
   ).replace(/\/+$/, "")
 
+  // Active session token retrieved directly from OS Credential Store (Windows DPAPI, macOS Keychain)
+  const authSession = getDeviceAuthService().getActiveSession()
   const apiKey =
+    authSession?.accessToken ||
+    process.env.ENTRY_SESSION_TOKEN ||
     process.env.GATEWAY_API_KEY ||
     conf.apiKey ||
-    process.env.ENTRY_API_KEY ||
     ""
 
   return {

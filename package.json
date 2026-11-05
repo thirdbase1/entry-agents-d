@@ -11,7 +11,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "test": "node --import ./tests/register.mjs --test tests/entry-provider.test.ts tests/git-naming.test.ts tests/models-route.test.ts",
+    "test": "node --import ./tests/register.mjs --test tests/entry-provider.test.ts tests/git-naming.test.ts tests/models-route.test.ts tests/device-auth.test.ts",
     "test:e2e": "node --test --test-concurrency=1 tests/e2e/*.test.mjs",
     "vendor:check": "node scripts/check-vendored.mjs",
     "typecheck": "tsc --noEmit",
