@@ -296,8 +296,7 @@ async function executeWorkspaceTool(
 }
 
 export function createEntryProvider(
-  settings: EntrySettings | undefined,
-  appSettings: AppSettings
+  settings: EntrySettings | undefined
 ): AgentProvider {
   const conf: EntrySettings = settings ?? {
     enabled: true,
@@ -495,7 +494,7 @@ export function createEntryProvider(
       ]
 
       let targetUrl = urlCandidates[0]
-      let maxToolSteps = 15
+      const maxToolSteps = 15
       let stepCount = 0
 
       while (stepCount < maxToolSteps) {
@@ -561,7 +560,7 @@ export function createEntryProvider(
         const lines = new LineBuffer()
 
         let currentAssistantContent = ""
-        let currentToolCalls: Array<{
+        const currentToolCalls: Array<{
           id: string
           type: "function"
           function: { name: string; arguments: string }

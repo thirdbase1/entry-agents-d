@@ -30,6 +30,10 @@ export function ProviderLogo({
   slug: string
   className?: string
 }): React.ReactElement | null {
+  // Gradient ids are document-global: two instances sharing one would paint
+  // from whichever came first, and from nothing once that one is hidden.
+  const id = React.useId().replace(/[^a-zA-Z0-9_-]/g, "")
+
   if (slug === "entry" || slug === "entry-agents") {
     return (
       <img
@@ -41,9 +45,6 @@ export function ProviderLogo({
     )
   }
 
-  // Gradient ids are document-global: two instances sharing one would paint
-  // from whichever came first, and from nothing once that one is hidden.
-  const id = React.useId().replace(/[^a-zA-Z0-9_-]/g, "")
   const color = BRAND_COLOR_MARKS[slug]
   if (color) {
     return (

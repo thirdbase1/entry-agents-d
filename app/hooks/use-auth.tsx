@@ -65,8 +65,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   React.useEffect(() => {
-    checkSession();
-    return () => clearPolling();
+    const timer = setTimeout(() => {
+      void checkSession();
+    }, 0);
+    return () => {
+      clearTimeout(timer);
+      clearPolling();
+    };
   }, [checkSession, clearPolling]);
 
   const poll = React.useCallback(
@@ -91,7 +96,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setStatus("session_expired");
           setError("Verification code expired. Please try again.");
         }
-      } catch (err) {
+      } catch {
         // network flicker, keep polling until timeout
       }
     },

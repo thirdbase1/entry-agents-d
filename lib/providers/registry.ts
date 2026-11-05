@@ -19,11 +19,11 @@ export type ProviderId = (typeof PROVIDER_IDS)[number]
 
 function build(id: string, settings: AppSettings): AgentProvider | null {
   const providers = settings.providers
-  if (id === ENTRY_PROVIDER_ID) return createEntryProvider(providers.entry, settings)
+  if (id === ENTRY_PROVIDER_ID) return createEntryProvider(providers.entry)
   return null
 }
 
-function isEnabled(id: string, _settings: AppSettings): boolean {
+function isEnabled(id: string): boolean {
   return id === ENTRY_PROVIDER_ID
 }
 
@@ -32,7 +32,7 @@ function isEnabled(id: string, _settings: AppSettings): boolean {
  */
 export async function getProvider(id: string): Promise<AgentProvider | null> {
   const settings = await readSettings()
-  if (!isEnabled(id, settings)) return null
+  if (!isEnabled(id)) return null
   return build(id, settings)
 }
 

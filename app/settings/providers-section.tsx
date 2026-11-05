@@ -3,7 +3,6 @@
 import * as React from "react"
 import { toast } from "sonner"
 
-import { HarnessLogo } from "@/components/provider-logo"
 import {
   Select,
   SelectContent,
@@ -11,7 +10,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Skeleton } from "@/components/ui/skeleton"
 import type { PermissionMode } from "@/lib/providers/types"
 import type { AppSettings } from "@/lib/settings/schema"
 
@@ -22,7 +20,7 @@ import {
   SetupLink,
 } from "./provider-row"
 import { StatusBadge, statusKey, useProviderStatus } from "./provider-status"
-import { SettingsRow, SettingsSection } from "./section"
+import { SettingsSection } from "./section"
 import type { AppSettingsApi } from "./use-app-settings"
 
 const PERMISSION_MODES: Array<{ id: PermissionMode; label: string; desc: string }> = [
