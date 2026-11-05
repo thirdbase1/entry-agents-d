@@ -296,8 +296,10 @@ async function executeWorkspaceTool(
 }
 
 export function createEntryProvider(
-  settings: EntrySettings | undefined
+  settings?: EntrySettings,
+  appSettings?: AppSettings
 ): AgentProvider {
+  void appSettings;
   const conf: EntrySettings = settings ?? {
     enabled: true,
     baseUrl: process.env.GATEWAY_BASE_URL || DEFAULT_GATEWAY_URL,

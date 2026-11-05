@@ -19,7 +19,7 @@ export type ProviderId = (typeof PROVIDER_IDS)[number]
 
 function build(id: string, settings: AppSettings): AgentProvider | null {
   const providers = settings.providers
-  if (id === ENTRY_PROVIDER_ID) return createEntryProvider(providers.entry)
+  if (id === ENTRY_PROVIDER_ID) return createEntryProvider(providers.entry, settings)
   return null
 }
 
