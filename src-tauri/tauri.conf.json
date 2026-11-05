@@ -46,7 +46,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "app", "dmg", "deb", "appimage"],
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "category": "DeveloperTool",
     "shortDescription": "Autonomous coding agent workspace connected to Entry platform",
     "longDescription": "Entry Agents is a local-first desktop chat client and autonomous coding workspace connected to the Entry platform. It bundles its own runtime and runs the app server on 127.0.0.1.",
