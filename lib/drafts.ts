@@ -1,0 +1,144 @@
+/**
+ * Composer state that survives a chat switch and a reload: the draft each
+ * chat had in its composer, and the stash — prompts parked with ⌘S.
+ *
+ * Both live in localStorage as text. A draft's files stay in memory only
+ * (`app/page.tsx` keeps them on the live map) and are lost with the tab,
+ * which is the honest trade: a File cannot be serialised without copying it.
+ */
+
+const DRAFTS_KEY = "agent-ui:drafts"
+const STASH_KEY = "agent-ui:stash"
+const MAX_DRAFT_CHARS = 20_000
+const MAX_STASH = 20
+
+export type StashEntry = {
+  id: string
+  text: string
+  createdAt: number
+  /** Names only — the File objects, when still around, ride on `files`. */
+  fileNames: string[]
+  files?: File[]
+  skills: string[]
+}
+
+function read<T>(key: string): T | null {
+  try {
+    const raw = window.localStorage.getItem(key)
+    return raw ? (JSON.parse(raw) as T) : null
+  } catch {
+    return null
+  }
+}
+
+function write(key: string, value: unknown) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    /* quota, private mode — the draft is a convenience */
+  }
+}
+
+export function readDrafts(): Record<string, string> {
+  const drafts = read<Record<string, string>>(DRAFTS_KEY)
+  // An array is an object too, and one stored here would be handed to the
+  // composer as its map of drafts.
+  return drafts && typeof drafts === "object" && !Array.isArray(drafts) ? drafts : {}
+}
+
+/** Writes one chat's draft; an empty draft removes the key. */
+export function writeDraft(sessionId: string, text: string) {
+  if (!sessionId) return
+  const drafts = readDrafts()
+  const trimmed = text.slice(0, MAX_DRAFT_CHARS)
+  if (trimmed.trim()) drafts[sessionId] = trimmed
+  else delete drafts[sessionId]
+  write(DRAFTS_KEY, drafts)
+}
+
+export type DraftWriter = ReturnType<typeof createDraftWriter>
+
+/**
+ * The composer's debounced write, per chat.
+ *
+ * Only one write is ever pending, because only one chat is open — but a chat
+ * switch calls straight back in with the *new* chat's text, so the pending
+ * write of the chat being left has to land before the timer is re-armed.
+ * Cancelling it instead is how the last keystrokes of every quickly abandoned
+ * chat used to be lost.
+ */
+export function createDraftWriter(delayMs: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let pending: { sessionId: string; text: string } | null = null
+
+  const cancel = () => {
+    if (timer !== undefined) clearTimeout(timer)
+    timer = undefined
+    pending = null
+  }
+
+  /** Writes whatever the timer is holding, now. */
+  const flush = () => {
+    const write = pending
+    cancel()
+    if (write) writeDraft(write.sessionId, write.text)
+  }
+
+  return {
+    flush,
+    /** Queues one chat's draft, flushing another chat's pending write first. */
+    schedule(sessionId: string, text: string) {
+      if (pending && pending.sessionId !== sessionId) flush()
+      if (!sessionId) return
+      if (timer !== undefined) clearTimeout(timer)
+      pending = { sessionId, text }
+      timer = setTimeout(flush, delayMs)
+    },
+    /** Drops a pending write for a chat that is not there to write it for. */
+    forget(sessionId: string) {
+      if (pending?.sessionId === sessionId) cancel()
+    },
+  }
+}
+
+/** Drops a deleted chat's draft, so the store does not outgrow the chats. */
+export function clearDraft(sessionId: string) {
+  const drafts = readDrafts()
+  if (!(sessionId in drafts)) return
+  delete drafts[sessionId]
+  write(DRAFTS_KEY, drafts)
+}
+
+export function readStash(): StashEntry[] {
+  const entries = read<StashEntry[]>(STASH_KEY)
+  if (!Array.isArray(entries)) return []
+  return entries
+    .filter(
+      (entry): entry is StashEntry =>
+        !!entry &&
+        typeof entry.id === "string" &&
+        typeof entry.text === "string"
+    )
+    .map((entry) => ({
+      id: entry.id,
+      text: entry.text,
+      createdAt: typeof entry.createdAt === "number" ? entry.createdAt : 0,
+      fileNames: Array.isArray(entry.fileNames) ? entry.fileNames : [],
+      skills: Array.isArray(entry.skills) ? entry.skills : [],
+    }))
+    .slice(0, MAX_STASH)
+}
+
+/** Persists the stash without its File objects. */
+export function writeStash(entries: StashEntry[]) {
+  write(
+    STASH_KEY,
+    entries.slice(0, MAX_STASH).map(({ id, text, createdAt, fileNames, skills }) => ({
+      id,
+      text,
+      createdAt,
+      fileNames,
+      skills,
+    }))
+  )
+}

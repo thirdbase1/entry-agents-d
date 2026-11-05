@@ -1,0 +1,1535 @@
+"use client"
+
+import { FileText, PanelLeft, PanelRight, Search } from "lucide-react"
+import dynamic from "next/dynamic"
+import * as React from "react"
+
+import {
+  AppHeader,
+  AppHeaderActions,
+  AppHeaderButton,
+} from "@/components/app-header"
+import { FilePanel } from "@/components/file-panel"
+import { PendingLineComments } from "@/components/line-comments"
+import { ChangesPanel } from "@/components/changes-panel"
+import { ChatComposer } from "@/components/chat-composer"
+import { AgentsPanel } from "@/components/agents-panel"
+import { AgentBreadcrumbs } from "@/components/agent-breadcrumbs"
+import { WorkspaceDock } from "@/components/workspace-dock"
+import { useAgentNavigation } from "./hooks/use-agent-navigation"
+import { useWorkspacePanel } from "./hooks/use-workspace-panel"
+import { ChatUsageSummary } from "@/components/chat-usage"
+import { ThreadLoading } from "@/components/chat-skeletons"
+import { ChatSidebarPanel } from "@/components/chat-sidebar-panel"
+import { CHAT_SUGGESTIONS } from "@/components/chat-suggestions"
+import { CommandPalette } from "@/components/command-palette"
+import {
+  ContextUsage,
+  canCompactContext,
+  useDraftStore,
+} from "@/components/context-usage"
+import { DiffWorkers } from "@/components/diff-workers"
+import { SnoozeChatDialog } from "@/components/snooze-chat-dialog"
+import { NewChatDialog } from "@/components/new-chat-dialog"
+import { ComposerModelPicker } from "@/components/composer-model-picker"
+import { FolderPicker } from "@/components/folder-picker"
+import { HandoffNotice } from "@/components/handoff-notice"
+import { MessageActions } from "@/components/message-actions"
+import {
+  PendingQuestion,
+  PendingUserRequest,
+} from "@/components/pending-question"
+import {
+  PermissionMenuItems,
+  PermissionPicker,
+} from "@/components/permission-picker"
+import { PlanPanel } from "@/components/plan-panel"
+import { ChatProcesses, ProcessesPanel } from "@/components/processes-panel"
+import { ProviderPicker } from "@/components/provider-picker"
+import { StashMenu } from "@/components/stash-menu"
+import { AgentMessageList } from "@/components/agent-message-list"
+import {
+  DEFAULT_MODEL_EFFORTS,
+} from "@/components/ui/model-picker"
+import { PromptSuggestions } from "@/components/ui/prompt-suggestions"
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "@/components/ui/resizable"
+import { TodoPanel } from "@/components/ui/todo-list"
+import { providerSessionHints } from "@/lib/handoff/types"
+import type { StoredMessage } from "@/lib/store/types"
+import type { UserRequest } from "@/lib/turn-requests"
+import { CACHE_ACTIVE_KEY, CACHE_INDEX_KEY, writeCache } from "@/lib/ui-cache"
+import { cn } from "@/lib/utils"
+
+import { EMPTY_MESSAGES, type SessionRun } from "./hooks/chat-types"
+import { useAgentConfig } from "./hooks/use-agent-config"
+import { useAttention } from "./hooks/use-attention"
+import { useChatActions } from "./hooks/use-chat-actions"
+import { useChatBootstrap } from "./hooks/use-chat-bootstrap"
+import { useChatNav } from "./hooks/use-chat-nav"
+import { useChatRefs, useMirrorRefs } from "./hooks/use-chat-refs"
+import { useChatShortcuts } from "./hooks/use-chat-shortcuts"
+import { useChatTurns } from "./hooks/use-chat-turns"
+import { useCommandPalette, useMessageJump } from "./hooks/use-command-palette"
+import { useComposerDrafts } from "./hooks/use-composer-drafts"
+import { useComposerHeight } from "./hooks/use-composer-height"
+import { useBackgroundProcesses } from "./hooks/use-background-processes"
+import { useChangesPanel } from "./hooks/use-changes-panel"
+import { usePlanPanel } from "./hooks/use-plan-panel"
+import {
+  CHAT_PANEL_ID,
+  MAX_PREVIEW_SIZE,
+  MIN_PREVIEW_SIZE,
+  PREVIEW_PANEL_ID,
+  WORKSPACE_GROUP_ID,
+  useFilePanel,
+} from "./hooks/use-file-panel"
+import { useIsDesktop } from "./hooks/use-is-desktop"
+import { useMessageQueue } from "./hooks/use-message-queue"
+import { useNotes } from "./hooks/use-notes"
+import { usePromptStash } from "./hooks/use-prompt-stash"
+import { useSessionIndex } from "./hooks/use-session-index"
+import { useSidebarItems } from "./hooks/use-sidebar-items"
+import { useSkills } from "./hooks/use-skills"
+import { useThreadView } from "./hooks/use-thread-view"
+import { useThreads } from "./hooks/use-threads"
+import { useSubagents } from "./hooks/use-subagents"
+import { useTurnRunner } from "./hooks/use-turn-runner"
+import type { SettingsSectionId } from "@/app/settings/settings-view"
+import * as api from "@/lib/api-client"
+import type { ViewAction } from "@/lib/generative-view"
+
+/**
+ * Settings render over the chat, so they live in this page's tree — but they
+ * are a whole second app's worth of sections, and the chat must not wait for
+ * them. Loaded on the first open, never during the critical path.
+ */
+const SettingsView = dynamic(
+  () => import("@/app/settings/settings-view").then((m) => m.SettingsView),
+  { ssr: false }
+)
+
+/**
+ * The same treatment for the import picker: it scans two CLIs' history
+ * directories and is opened once in a while, so nothing about it belongs on
+ * the path of the first paint.
+ */
+const ImportDialog = dynamic(
+  () => import("@/components/import-dialog").then((m) => m.ImportDialog),
+  { ssr: false }
+)
+
+/**
+ * A note's editor (Milkdown, Mermaid, KaTeX) is the heaviest thing the app
+ * can show and most sessions never open one, so it loads on the first open.
+ */
+const NoteWorkspace = dynamic(
+  () => import("@/components/note-workspace").then((m) => m.NoteWorkspace),
+  { ssr: false }
+)
+
+/**
+ * The chat surface. Deliberately a pure client component: sessions, providers
+ * and settings are fetched from the app's routes after mount (seeded from a
+ * localStorage snapshot so the sidebar paints immediately), and nothing on the
+ * critical path waits on the server.
+ *
+ * This file is the composition root and the layout — the state behind it lives
+ * in `app/hooks/`, one hook per concern, wired together here in the order the
+ * data flows: the index, then the threads, then what a turn runs with, then the
+ * turn itself, then everything derived for the view.
+ */
+export default function ChatPage() {
+  const isDesktop = useIsDesktop()
+  /**
+   * Settings open *over* the chat rather than at `/settings`: this page owns
+   * every in-flight turn, and a route change unmounts it — which aborts the
+   * fetch, which the chat route reads as the client giving up and kills the
+   * run. Null = closed; a section id = open on that section.
+   */
+  const [settingsSection, setSettingsSection] =
+    React.useState<SettingsSectionId | null>(null)
+  const [dataDir, setDataDir] = React.useState("")
+  /** The import picker, opened from ⌘K. */
+  const [importOpen, setImportOpen] = React.useState(false)
+  const refs = useChatRefs()
+  const { composerRef, sessionsRef } = refs
+
+  const index = useSessionIndex()
+  const {
+    sessions,
+    setSessions,
+    activeId,
+    setActiveId,
+    sessionsLoaded,
+    setSessionsLoaded,
+    patchLocal,
+    renameSession,
+    togglePin,
+    regenerateTitle,
+  } = index
+
+  const { threads, setThreads, cacheThread, loadThread } = useThreads(refs)
+
+  const config = useAgentConfig({ refs, patchLocal })
+  const {
+    settings,
+    providers,
+    providerId,
+    models,
+    capabilities,
+    visionModels,
+    model,
+    effort,
+    setEffort,
+    permissionModes,
+    chosenPermission,
+    effectivePermission,
+    adoptAgent,
+    chooseProvider,
+    configureProvider,
+    chooseModel,
+    choosePermission,
+    providerName,
+    showEfforts,
+    activeProviderName,
+    pickerGroups,
+    pickerModels,
+  } = config
+
+  const {
+    collapsed,
+    setCollapsed,
+    sidebarWidth,
+    saveSidebarWidth,
+    closedSections,
+    toggleSection,
+    paletteOpen,
+    setPaletteOpen,
+    openPalette,
+    renameRequest,
+    startRename,
+    drawerOpen,
+    drawerRef,
+    drawerTriggerRef,
+    closeDrawer,
+    closeNav,
+    openNav,
+    toggleSidebar,
+  } = useChatNav({ isDesktop, sessionsRef })
+
+  /*
+   * Which chats are running, and which ended badly. Shared spine: the turn
+   * runner writes them, the sidebar and the header read them, and deleting a
+   * chat drops its entry — so they sit here rather than inside one hook.
+   */
+  const [runs, setRuns] = React.useState<Record<string, SessionRun>>({})
+  const [failures, setFailures] = React.useState<Record<string, boolean>>({})
+
+  const messages: StoredMessage[] = threads[activeId] ?? EMPTY_MESSAGES
+  const activeSession = sessions.find((session) => session.id === activeId)
+  const activeRun = runs[activeId]
+  const isGenerating = !!activeRun
+  const activeCwd = activeSession?.cwd
+  const activeFolder = activeSession?.cwd?.trim() ?? ""
+  const revertProvider = activeSession?.providerId || providerId
+  const threadLoading =
+    !!activeId &&
+    threads[activeId] === undefined &&
+    (activeSession?.messageCount ?? 0) > 0
+  const isEmptyChat = messages.length === 0 && !threadLoading
+  /**
+   * What each agent already holds in this chat, for the composer's provider
+   * list. Left to the compiler to memoize — a hand-written `useMemo` over a
+   * value derived from `sessions` is exactly the shape it refuses to preserve.
+   */
+  const sessionHints = providerSessionHints(
+    activeSession?.agentSessions,
+    activeSession?.cwd
+  )
+
+  /**
+   * What this chat can run: the `$` menu's skills and the harness commands its
+   * `/` menu adds, scanned from the chat's own folder.
+   */
+  const skillCatalog = useSkills({ activeId, cwd: activeCwd, isGenerating })
+
+  const panel = useFilePanel({
+    refs,
+    activeId,
+    activeCwd,
+    revertProvider,
+    defaultEditor: settings?.editor.defaultEditor ?? "",
+  })
+  const {
+    preview,
+    previewBinary,
+    previewNotice,
+    previewSize,
+    previewPrefs,
+    closePreview,
+    saveSplit,
+    setDiffLayout,
+    setWrap,
+    handleCopyPath,
+    confirmRestoreTurn,
+    fileActions,
+    resolveFileUrl,
+    handleOpenFile,
+    handleChangeFileClick,
+    handleFileReferenceClick,
+    handleChatChangeClick,
+    handleReviewChanges,
+  } = panel
+
+  const { stash, parkDraft, handleStash, restoreStash, discardStash } =
+    usePromptStash(refs)
+
+  const {
+    queues,
+    setQueues,
+    queueItems,
+    handleQueue,
+    takeQueued,
+    handleQueueRemove,
+    handleQueueEdit,
+  } = useMessageQueue({
+    refs,
+    activeId,
+    parkDraft,
+    config: React.useMemo(
+      () => ({
+        providerId,
+        model,
+        effort: capabilities?.effort ? effort : undefined,
+        permissionMode: chosenPermission || undefined,
+        vision: !!capabilities?.vision && visionModels.includes(model),
+      }),
+      [
+        providerId,
+        model,
+        capabilities?.effort,
+        capabilities?.vision,
+        effort,
+        chosenPermission,
+        visionModels,
+      ]
+    ),
+  })
+
+  /*
+   * The mirrors are written here, before the composer's draft effect below:
+   * restoring a chat's parked draft calls the composer's `onTextChange`
+   * synchronously, and that handler reads `activeIdRef` to decide which chat
+   * to save the text under. A mirror one render behind would file the newly
+   * opened chat's draft under the one just left.
+   */
+  useMirrorRefs(refs, {
+    threads,
+    activeId,
+    sessions,
+    providers,
+    providerId,
+    model,
+    settings,
+    queues,
+  })
+
+  const draftStore = useDraftStore()
+  const { forgetDraft, handleTextChange, handleMentions, handleQuote } =
+    useComposerDrafts({ refs, activeId, draftStore })
+
+  const {
+    selectSession,
+    openFolder,
+    setFolder,
+    removeSession,
+    removeSessions,
+    handleNewChat: createNewChat,
+    settleChat,
+    snoozeChat,
+    wakeChat,
+    adoptChat,
+    markVisited,
+  } = useChatActions({
+    refs,
+    sessions,
+    activeId,
+    activeFolder,
+    openThreadLength: messages.length,
+    providerId,
+    model,
+    chosenPermission,
+    setSessions,
+    setActiveId,
+    setThreads,
+    setRuns,
+    setFailures,
+    setQueues,
+    patchLocal,
+    cacheThread,
+    loadThread,
+    adoptAgent,
+    closePreview,
+    closeNav,
+    forgetDraft,
+  })
+
+  const runPrompt = useTurnRunner({
+    refs,
+    setThreads,
+    setRuns,
+    setFailures,
+    patchLocal,
+    notificationSounds: settings?.chat.notificationSounds,
+  })
+
+  /**
+   * Opens the settings panel. `dataDir` is read the first time it opens — the
+   * panel has no server render to read `AGENT_UI_DIR` in, and it is only ever
+   * shown as a line of text in the Data section.
+   */
+  const openSettings = React.useCallback(
+    (section: SettingsSectionId = "appearance") => {
+      setSettingsSection(section)
+      setDataDir((current) => {
+        if (!current) {
+          void api
+            .fetchDataDir()
+            .then(setDataDir)
+            .catch(() => {
+              /* the Data section simply shows nothing */
+            })
+        }
+        return current
+      })
+    },
+    []
+  )
+  /** Closing re-reads settings and providers: either may have changed. */
+  const { refresh: refreshConfig } = config
+  const closeSettings = React.useCallback(() => {
+    setSettingsSection(null)
+    refreshConfig()
+  }, [refreshConfig])
+  /**
+   * Settings → Data has deleted every chat. The page behind the panel still
+   * holds the whole index, the open thread and its queue in memory, and would
+   * re-seed the sidebar from its own snapshot on the next reload, so all of it
+   * goes at once — the panel only tells us it happened.
+   */
+  const handleSessionsCleared = React.useCallback(() => {
+    setSessions([])
+    setActiveId("")
+    setThreads({})
+    setQueues({})
+    writeCache(CACHE_INDEX_KEY, [])
+    writeCache(CACHE_ACTIVE_KEY, "")
+  }, [setActiveId, setQueues, setSessions, setThreads])
+  /**
+   * The import dialog has just written chats into the store. Only the index
+   * has to be re-read: the transcripts it wrote are loaded the moment one of
+   * them is opened, like any other chat's.
+   */
+  const reloadSessions = React.useCallback(() => {
+    void api
+      .fetchSessions()
+      .then(setSessions)
+      .catch(() => {
+        /* the dialog already said what failed */
+      })
+  }, [setSessions])
+  const openImport = React.useCallback(() => setImportOpen(true), [])
+
+  /** The sidebar, ⌘K and `/settings`, none of which name a section. */
+  const pushSettings = React.useCallback(() => openSettings(), [openSettings])
+  const [newChatOpen, setNewChatOpen] = React.useState(false)
+  const notes = useNotes()
+  const { closeNote, openNote, newNote, activeNoteId } = notes
+  /** Where the open note puts its header controls — a node in the app header. */
+  const [noteHeaderSlot, setNoteHeaderSlot] = React.useState<HTMLDivElement | null>(null)
+  const handleNewChat = React.useCallback(async () => {
+    closeNav()
+    closeNote()
+    setNewChatOpen(true)
+  }, [closeNav, closeNote, setNewChatOpen])
+  /** The void wrapper the sidebar, the palette and ⌘N all share. */
+  const startNewChat = React.useCallback(
+    () => void handleNewChat(),
+    [handleNewChat]
+  )
+
+  const {
+    send,
+    handleSend,
+    handleSteer,
+    handleQueueSendNow,
+    handleStop,
+    handleAskAnswer,
+    handleRequestAnswer,
+    handlePlanBuild,
+    handleCompact,
+    handleEditMessage,
+    handleRegenerate,
+    handleDeleteMessage,
+  } = useChatTurns({
+    refs,
+    runPrompt,
+    loadThread,
+    activeId,
+    sessions,
+    providers,
+    providerId,
+    model,
+    effort,
+    capabilities,
+    visionModels,
+    chosenPermission,
+    effectivePermission,
+    permissionModes,
+    choosePermission,
+    autoTitle: settings?.chat.autoTitle,
+    patchLocal,
+    adoptChat,
+    setSessions,
+    setActiveId,
+    setThreads,
+    setRuns,
+    setFailures,
+    takeQueued,
+    handleNewChat,
+    renameSession,
+    regenerateTitle,
+    startRename,
+    openFolder,
+    pushSettings,
+    knownSkillNamesRef: skillCatalog.knownSkillNamesRef,
+  })
+
+  /**
+   * A button or form in an answer's ` ```ui ` view speaks as the user: sent
+   * now, or queued behind a running turn exactly like anything typed into the
+   * composer mid-turn. `MessageList` holds it at one identity for its rows.
+   */
+  const handleViewAction = React.useCallback(
+    (_messageId: string, action: ViewAction) => {
+      const payload = { text: action.text, files: [], skills: [] }
+      if (isGenerating) handleQueue(payload)
+      else handleSend(payload)
+    },
+    [handleQueue, handleSend, isGenerating]
+  )
+
+  const {
+    listMessages,
+    todos,
+    plan,
+    contextTurn,
+    contextTotal,
+    contextSource,
+    contextConversation,
+    activeCost,
+    lastTurnFinishedAt,
+    usage,
+    pendingRequest,
+    waitingCount,
+    chatChanges,
+    history,
+  } = useThreadView({
+    messages,
+    threads,
+    activeId,
+    runs,
+    models,
+    model,
+    isGenerating,
+  })
+
+  /* The composer only cares *whether* an answer is owed. `pendingRequest` is a
+     new object every time the transcript is rewritten, so the memoized composer
+     takes the boolean and stays off the per-token render path. */
+  const hasPendingAsk = pendingRequest?.kind === "ask"
+
+  /* The same request, docked to the composer's top edge as a drawer. Keyed on
+     what the request *says* rather than on the object, for the reason above:
+     the form is rebuilt when the question changes, never per token. */
+  const askMessageId =
+    pendingRequest?.kind === "ask" ? pendingRequest.messageId : undefined
+  const askToolId =
+    pendingRequest?.kind === "ask" ? pendingRequest.toolId : undefined
+  const askInput =
+    pendingRequest?.kind === "ask" ? pendingRequest.input : undefined
+  const requestJson =
+    pendingRequest && pendingRequest.kind !== "ask"
+      ? JSON.stringify(pendingRequest.request)
+      : undefined
+  const pendingBanner = React.useMemo(() => {
+    if (askMessageId && askToolId) {
+      /* Answerable while the turn generates, which is when it matters most: a
+         harness that cannot block on its own ask tool keeps going, so answering
+         stops the turn rather than waiting for it (`handleAskAnswer`). */
+      return (
+        <PendingQuestion
+          key={`${activeId}:${askMessageId}:${askToolId}`}
+          messageId={askMessageId}
+          toolId={askToolId}
+          input={askInput}
+          onAnswer={handleAskAnswer}
+        />
+      )
+    }
+    if (requestJson) {
+      /* Deliberately *not* disabled while generating: a running turn blocked
+         on this answer is the only time it exists. */
+      const request = JSON.parse(requestJson) as UserRequest
+      return (
+        <PendingUserRequest
+          key={`${activeId}:${request.id}`}
+          request={request}
+          onAnswer={handleRequestAnswer}
+        />
+      )
+    }
+    return null
+  }, [
+    activeId,
+    askInput,
+    askMessageId,
+    askToolId,
+    handleAskAnswer,
+    handleRequestAnswer,
+    requestJson,
+  ])
+
+  const {
+    sessionItems,
+    pinnedItems,
+    activeItems,
+    sessionMenuActions,
+    sessionRowActions,
+    snoozeTarget,
+    setSnoozeTarget,
+    agentsShelf,
+    snoozedShelf,
+    settledShelf,
+    showMoreOnShelf,
+  } = useSidebarItems({
+    refs,
+    sessions,
+    runs,
+    failures,
+    threads,
+    closedSections,
+    activeId,
+    providerName,
+    regenerateTitle,
+    onSettle: settleChat,
+    onSnooze: snoozeChat,
+    onWake: wakeChat,
+    onMarkVisited: markVisited,
+    onAdopt: adoptChat,
+  })
+
+  const { paletteActions, paletteSessions } = useCommandPalette({
+    sessions,
+    activeId,
+    activeCwd,
+    providerName,
+    regenerateTitle,
+    openFolder,
+    openImport,
+  })
+
+  const agentRuns = useSubagents({ refs, runPrompt, loadThread, setSessions })
+  const agentNav = useAgentNavigation({
+    activeId,
+    messages,
+    agentRuns,
+    selectSession,
+  })
+  const navigateAgent = agentNav.navigate
+  /** Opening a chat from the sidebar puts away the note that covered it. */
+  const selectChat = React.useCallback(
+    (id: string) => {
+      closeNote()
+      navigateAgent(id)
+    },
+    [closeNote, navigateAgent]
+  )
+  const selectNote = React.useCallback(
+    (id: string) => {
+      openNote(id)
+      closeNav()
+    },
+    [openNote, closeNav]
+  )
+  const startNewNote = React.useCallback(() => {
+    newNote()
+    closeNav()
+  }, [newNote, closeNav])
+  const workspacePanel = useWorkspacePanel()
+
+  useChatBootstrap({
+    seedFromCache: index.seedFromCache,
+    hydrateConfig: config.hydrate,
+    hydrateSessions: index.hydrate,
+    adoptAgent,
+    setSessionsLoaded,
+    loadThread,
+    activeIdRef: refs.activeIdRef,
+    sessionsRef: refs.sessionsRef,
+  })
+
+  useAttention({
+    waitingCount,
+    /* Turns in flight, for the hold-to-quit overlay in the root layout. */
+    runningCount: Object.keys(runs).length,
+    activeTitle: activeSession?.title?.trim() ?? "",
+  })
+
+  useChatShortcuts({ refs, handleNewChat, toggleSidebar, openFolder })
+
+  /** Opening a chat *at* the message a palette search matched. */
+  const openMessage = useMessageJump({ refs, selectSession, loadThread })
+
+  const { chatPaneRef, composerBoxRef } = useComposerHeight()
+
+  /**
+   * The side panel holds one thing at a time: the file the user opened, or the
+   * plan the agent wrote. The file wins while it is open — a file is opened by
+   * a click and a plan by the agent, and the click is the more recent intent —
+   * and closing it brings the plan back rather than losing it.
+   */
+  const { openPlan, closePlan, reopenPlan } = usePlanPanel({ activeId, plan })
+  const {
+    changesOpen,
+    toggle: toggleChanges,
+    close: closeChanges,
+  } = useChangesPanel(activeId)
+  const {
+    processes,
+    processesOpen,
+    toggle: toggleProcesses,
+    close: closeProcesses,
+    stop: stopProcess,
+  } = useBackgroundProcesses({ activeId, isGenerating })
+
+  /**
+   * One panel, four things that want it, in the order of how recently the
+   * user asked for each: a file they clicked, the review or the background
+   * processes they opened from the header, then the plan the agent wrote. Closing the one on top uncovers the
+   * next rather than emptying the panel.
+   */
+  const sidePanel = preview
+    ? "file"
+    : changesOpen
+      ? "changes"
+      : processesOpen
+        ? "processes"
+        : openPlan
+          ? "plan"
+          : null
+
+  // The panel is a resizable pane on desktop and an overlay below md.
+  // Derived, so exactly one of each is ever mounted.
+  const dockedPanel = isDesktop ? sidePanel : null
+  const overlayPanel = isDesktop ? null : sidePanel
+  const workspaceVisible = workspacePanel.open && !sidePanel
+  const dockedPreview = dockedPanel === "file" ? preview : null
+  const overlayPreview = overlayPanel === "file" ? preview : null
+
+  /**
+   * Build is offered in the panel header, so the transcript's own card stops
+   * offering it — one plan must not carry two buttons that start the same
+   * turn. The card stays as that turn's record, which is what every plan but
+   * the newest one already is.
+   */
+  const planBuild = openPlan ? undefined : handlePlanBuild
+
+  /**
+   * A path named inside the plan opens the same way one named in an answer
+   * does — `handleFileReferenceClick` resolves it against the turn that wrote
+   * it, so it needs the message the plan came from.
+   */
+  /**
+   * A transcript row asking for its plan back. Only the live one has a panel
+   * to go to; an older row still collapses (its plan is not this chat's
+   * proposal any more) but pressing it does nothing, which is why the handler
+   * checks rather than the row.
+   */
+  const livePlanMessageId = plan?.messageId
+  const handlePlanOpen = React.useCallback(
+    (messageId: string) => {
+      if (messageId === livePlanMessageId) reopenPlan()
+    },
+    [livePlanMessageId, reopenPlan]
+  )
+
+  /** A row in the changes map, opened as a file in the panel beside it. */
+  const handleChangesFileOpen = React.useCallback(
+    (path: string) => handleChatChangeClick({ path }),
+    [handleChatChangeClick]
+  )
+
+  const planMessageId = openPlan?.messageId
+  const handlePlanFileClick = React.useCallback(
+    (path: string, line?: number) => {
+      if (planMessageId) handleFileReferenceClick(planMessageId, path, line)
+    },
+    [handleFileReferenceClick, planMessageId]
+  )
+
+  /* Whether this chat's harness can shorten its own conversation — the meter's
+     "Compact context" and the offer to do it before resuming. */
+  const canCompact = canCompactContext(providerId, skillCatalog.commands)
+
+  /**
+   * The composer holds the draft the user is typing and has nothing to do with
+   * the answer streaming above it, so it is kept off the per-frame render path.
+   */
+  const composer = React.useMemo(
+    () => (
+      <ChatComposer
+        onSteer={handleSteer}
+        onQueueSendNow={handleQueueSendNow}
+        ref={composerRef}
+        onSend={handleSend}
+        onStop={handleStop}
+        onTextChange={handleTextChange}
+        onQueue={handleQueue}
+        queue={queueItems}
+        onQueueRemove={handleQueueRemove}
+        onQueueEdit={handleQueueEdit}
+        onStash={handleStash}
+        /* ArrowUp in an untouched composer walks back through what was already
+           sent in this chat. Identity-stable (`use-thread-view`), so the
+           memoized composer is not rebuilt for it on every token. */
+        history={history}
+        mentions={handleMentions}
+        /* `$name` offers what this machine has, and the `/` menu carries the
+           harness's own commands under the app's. Both only run at the head of
+           a message — a `/compact` mid-sentence is prose to every CLI. */
+        skills={skillCatalog.skills}
+        slashCommands={skillCatalog.slashCommands}
+        commandsMustStartMessage
+        banners={pendingBanner}
+        isGenerating={isGenerating}
+        placeholder={
+          isGenerating
+            ? undefined
+            : hasPendingAsk
+              ? "Add more optional details…"
+              : activeProviderName
+                ? `Ask ${activeProviderName}…`
+                : "Ask anything"
+        }
+        /* The composer already measures like the message column; the empty
+           chat only closes the gap under it, since the suggestions land there. */
+        className={cn(
+          "transition-[padding] duration-300 ease-out",
+          isEmptyChat && "pb-0 sm:pb-0"
+        )}
+        toolsMenu={
+          permissionModes.length > 0 && effectivePermission ? (
+            <PermissionMenuItems
+              modes={permissionModes}
+              value={effectivePermission}
+              onChange={choosePermission}
+            />
+          ) : undefined
+        }
+        tools={
+          <>
+            <ProviderPicker
+              providers={providers}
+              value={providerId}
+              onChange={chooseProvider}
+              sessions={sessionHints}
+              onConfigure={configureProvider}
+            />
+            <ComposerModelPicker
+              value={model}
+              onChange={chooseModel}
+              options={pickerModels}
+              /* One section is just the flat list with a heading over it. */
+              groups={pickerGroups.length > 1 ? pickerGroups : undefined}
+              efforts={showEfforts ? DEFAULT_MODEL_EFFORTS : false}
+              effort={effort}
+              onEffortChange={setEffort}
+              loading={config.modelsLoading}
+              onRefresh={config.refreshModels}
+              className="min-w-0"
+            />
+            {permissionModes.length > 0 && effectivePermission ? (
+              <PermissionPicker
+                modes={permissionModes}
+                value={effectivePermission}
+                onChange={choosePermission}
+              />
+            ) : null}
+            <ContextUsage
+              store={draftStore}
+              input={contextTurn.input}
+              output={contextTurn.output}
+              cached={contextTurn.cached}
+              conversation={contextConversation}
+              source={contextSource}
+              total={contextTotal}
+              cost={activeCost}
+              sessionId={activeId}
+              providerId={providerId}
+              lastTurnAt={lastTurnFinishedAt}
+              canCompact={canCompact}
+              onCompact={handleCompact}
+            />
+            <StashMenu
+              entries={stash}
+              onRestore={restoreStash}
+              onDiscard={discardStash}
+            />
+          </>
+        }
+      />
+    ),
+    [
+      activeCost,
+      activeId,
+      activeProviderName,
+      canCompact,
+      chooseModel,
+      choosePermission,
+      chooseProvider,
+      composerRef,
+      configureProvider,
+      contextTotal,
+      contextTurn.input,
+      contextTurn.output,
+      contextTurn.cached,
+      contextConversation,
+      contextSource,
+      discardStash,
+      draftStore,
+      effectivePermission,
+      effort,
+      handleCompact,
+      handleMentions,
+      handleQueue,
+      handleQueueEdit,
+      handleQueueRemove,
+      handleSend,
+      handleSteer,
+      handleQueueSendNow,
+      handleStash,
+      handleStop,
+      handleTextChange,
+      hasPendingAsk,
+      history,
+      isEmptyChat,
+      isGenerating,
+      lastTurnFinishedAt,
+      model,
+      pendingBanner,
+      permissionModes,
+      pickerGroups,
+      pickerModels,
+      providerId,
+      providers,
+      queueItems,
+      restoreStash,
+      sessionHints,
+      setEffort,
+      showEfforts,
+      config.modelsLoading,
+      config.refreshModels,
+      skillCatalog.skills,
+      skillCatalog.slashCommands,
+      stash,
+    ]
+  )
+
+  return (
+    <div className="relative flex h-full min-h-0 overflow-hidden bg-background pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)]">
+      {/* Below md the sidebar slides over the conversation instead of squeezing it. */}
+      <div
+        aria-hidden={!drawerOpen}
+        onClick={closeDrawer}
+        className={cn(
+          "absolute inset-0 z-40 bg-foreground/20 backdrop-blur-[1px] transition-opacity duration-200 motion-reduce:transition-none md:hidden",
+          drawerOpen ? "opacity-100" : "pointer-events-none opacity-0"
+        )}
+      />
+      <div
+        ref={drawerRef}
+        // Off-canvas below md: keep the hidden drawer out of the tab order.
+        inert={!isDesktop && !drawerOpen}
+        tabIndex={-1}
+        role={!isDesktop ? "dialog" : undefined}
+        aria-modal={!isDesktop && drawerOpen ? true : undefined}
+        aria-label={!isDesktop ? "Chats" : undefined}
+        className={cn(
+          "z-50 h-full shrink-0 max-md:absolute max-md:inset-y-0 max-md:left-0 max-md:pt-[env(safe-area-inset-top)] max-md:pb-[env(safe-area-inset-bottom)] max-md:pl-[env(safe-area-inset-left)] max-md:shadow-xl max-md:transition-transform max-md:duration-200 max-md:motion-reduce:transition-none md:relative",
+          !drawerOpen && "max-md:-translate-x-full"
+        )}
+      >
+        <ChatSidebarPanel
+          sessionItems={sessionItems}
+          pinnedItems={pinnedItems}
+          activeItems={activeItems}
+          agentsShelf={agentsShelf}
+          snoozedShelf={snoozedShelf}
+          settledShelf={settledShelf}
+          onShelfShowMore={showMoreOnShelf}
+          onSettle={settleChat}
+          onWake={wakeChat}
+          onAdopt={adoptChat}
+          activeId={activeNoteId ? "" : activeId}
+          noteItems={notes.noteItems}
+          activeNoteId={activeNoteId ?? ""}
+          onNewNote={startNewNote}
+          onSelectNote={selectNote}
+          onDeleteNote={notes.removeNote}
+          sessionsLoaded={sessionsLoaded}
+          sessionsRef={sessionsRef}
+          sessions={sessions}
+          providerName={providerName}
+          closedSections={closedSections}
+          onToggleSection={toggleSection}
+          renameRequest={renameRequest}
+          isDesktop={isDesktop}
+          collapsed={collapsed}
+          onCollapsedChange={setCollapsed}
+          onCloseDrawer={closeDrawer}
+          onNewChat={startNewChat}
+          onOpenPalette={openPalette}
+          onOpenSettings={pushSettings}
+          onSelect={selectChat}
+          onRename={renameSession}
+          onTogglePin={togglePin}
+          onDelete={removeSession}
+          onDeleteMany={removeSessions}
+          onReorder={setSessions}
+          getMenuActions={sessionMenuActions}
+          renderActions={sessionRowActions}
+          sidebarWidth={sidebarWidth}
+          onSidebarWidthChange={saveSidebarWidth}
+        />
+      </div>
+
+      <div
+        inert={!isDesktop && drawerOpen}
+        className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+      >
+        <AppHeader overlay>
+          <button
+            ref={drawerTriggerRef}
+            type="button"
+            aria-label="Open chats"
+            aria-expanded={drawerOpen}
+            title="Open chats"
+            onClick={openNav}
+            className="-ml-1 inline-grid size-9 shrink-0 place-items-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 md:hidden [&_svg]:size-4"
+          >
+            <PanelLeft />
+          </button>
+          {activeNoteId ? (
+            <nav
+              aria-label="Note"
+              data-slot="app-header-note"
+              data-tauri-drag-region
+              className="relative z-10 flex min-w-0 flex-1 self-stretch items-center gap-1.5 text-[12px] text-muted-foreground"
+            >
+              <FileText className="size-3.5 shrink-0" />
+              <span className="hidden shrink-0 sm:inline">Notes</span>
+              <span aria-hidden className="hidden sm:inline">/</span>
+              <span aria-current="page" className="truncate font-semibold text-foreground">
+                {notes.notes.find((note) => note.id === activeNoteId)?.title ?? "Note"}
+              </span>
+            </nav>
+          ) : (
+            <AgentBreadcrumbs session={activeSession} sessions={sessions} cards={agentNav.cards} selected={agentNav.selected} onNavigate={agentNav.navigate} onOpenAgent={agentNav.openAgent} onReturn={agentNav.returnToParent} />
+          )}
+          {activeNoteId ? (
+            <AppHeaderActions className="min-w-0">
+              {/* The open note renders its own controls here (NoteWorkspace). */}
+              <div ref={setNoteHeaderSlot} className="contents" />
+              <AppHeaderButton label="Search chats and commands" hint="⌘K" onClick={openPalette}>
+                <Search />
+              </AppHeaderButton>
+            </AppHeaderActions>
+          ) : null}
+          <AppHeaderActions className={cn("min-w-0", activeNoteId && "hidden")}>
+            <AppHeaderButton label="Toggle workspace panel" aria-controls="workspace-panel" aria-expanded={workspaceVisible} disabled={!!sidePanel} onClick={workspacePanel.toggle}><PanelRight /></AppHeaderButton>
+            <ChatProcesses
+              count={processes.length}
+              open={processesOpen}
+              onToggle={toggleProcesses}
+            />
+            <ChatUsageSummary usage={usage} />
+            <AppHeaderButton
+              label="Search chats and commands"
+              hint="⌘K"
+              onClick={openPalette}
+            >
+              <Search />
+            </AppHeaderButton>
+          </AppHeaderActions>
+        </AppHeader>
+
+        {/*
+          An open note covers the chat instead of replacing it: this page owns
+          every in-flight turn, and nothing under the note is unmounted.
+        */}
+        {activeNoteId ? (
+          // Above the chat composer (z-20), below the header (z-30).
+          <div className="absolute inset-0 z-[25] bg-background pt-12">
+            <NoteWorkspace
+              key={activeNoteId}
+              noteId={activeNoteId}
+              onClose={closeNote}
+              onMetaChange={notes.updateNote}
+              headerSlot={noteHeaderSlot}
+            />
+          </div>
+        ) : null}
+
+        {/*
+          The header overlays this pane (frost + fade) so the conversation
+          can scroll through it. It still spans the full width right of the
+          sidebar — it is the desktop window's drag chrome and must never be
+          covered or squeezed by the file panel. Side panels pad `pt-12` so
+          their own toolbars sit under the window controls. The `relative`
+          here is what the below-md overlay anchors to.
+        */}
+        <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
+          {/*
+            One worker pool for the whole workspace, mounted here rather than
+            per panel: every `DiffView` under it — the file panel, the diffs
+            inside tool rows — highlights off the main thread, and the pool is
+            reference counted and kept warm, so opening files in a row spawns
+            workers only the first time. The wrapper is what keeps it off the
+            prerender; see `components/diff-workers`.
+          */}
+          {workspaceVisible && !activeNoteId ? (
+            <aside
+              id="workspace-panel"
+              aria-label="Workspace tools"
+              data-slot="workspace-panel"
+              className="absolute right-3 top-14 z-30 max-h-[calc(100%-4rem)] w-[min(18rem,calc(100%-1.5rem))] max-xl:w-[min(15rem,calc(100%-1.5rem))] overflow-y-auto rounded-2xl bg-background shadow-lg"
+              onKeyDown={(event) => {
+                if (event.key === "Escape") workspacePanel.close()
+              }}
+            >
+              <WorkspaceDock
+                sessionId={activeId}
+                running={
+                  isGenerating ||
+                  Object.values(agentRuns).some(
+                    (run) =>
+                      run.parentId === activeId && run.status === "running"
+                  )
+                }
+                cwd={activeCwd}
+                branch={
+                  activeSession?.gitBranch || activeSession?.worktree?.branch
+                }
+                files={chatChanges}
+                onChanges={() => {
+                  if (!changesOpen) toggleChanges()
+                }}
+              >
+                <AgentsPanel
+                  embedded
+                  sessionId={activeId}
+                  sessions={sessions}
+                  messages={messages}
+                  agentRuns={agentRuns}
+                  onSelect={agentNav.navigate}
+                  onOpenNative={agentNav.openNativeTool}
+                />
+              </WorkspaceDock>
+            </aside>
+          ) : null}
+          <DiffWorkers>
+            {/*
+              Desktop: the conversation and the file panel are two panes of one
+              draggable split. A pane's content wrapper carries an inline
+              `overflow: auto`, so the children that own their own scrolling turn
+              it off through `style` — a class would lose to the inline rule.
+            */}
+            <ResizablePanelGroup
+              id={WORKSPACE_GROUP_ID}
+              orientation="horizontal"
+              onLayoutChanged={saveSplit}
+              className="min-w-0 flex-1"
+            >
+              <ResizablePanel
+                id={CHAT_PANEL_ID}
+                defaultSize={`${100 - previewSize}%`}
+                minSize="40%"
+                className="flex min-w-0 flex-col"
+                style={{ overflow: "hidden" }}
+              >
+                <div
+                  ref={chatPaneRef}
+                  className={cn(
+                    "relative flex min-h-0 flex-1 flex-col overflow-x-hidden",
+                    isEmptyChat && "justify-center"
+                  )}
+                >
+                  {threadLoading ? (
+                    <ThreadLoading />
+                  ) : isEmptyChat ? (
+                    <div className="w-full">
+                      <div
+                        data-slot="chat-opening"
+                        className="mx-auto w-full max-w-3xl px-3 pb-5 sm:px-4"
+                      >
+                        <h2 className="text-center text-2xl font-semibold tracking-tight text-balance text-foreground sm:text-3xl">
+                          How can I help?
+                        </h2>
+                      </div>
+                    </div>
+                  ) : (
+                    <AgentMessageList
+                      rawMessages={messages}
+                      agentRuns={agentRuns}
+                      selectedAgent={agentNav.selected}
+                      onOpenAgent={agentNav.openAgent}
+                      /* Room for the island above, inside the scroller — so the
+                         last turn settles clear of it and everything above
+                         still scrolls the whole height of the pane.
+
+                         `pt-14` clears the overlay header so the first turn
+                         is not sitting under the frost; `pt-4` used to be
+                         enough when the bar took a strip of its own.
+                         `py-4` on the list does not always lose to an
+                         arbitrary `pb-[calc]` in the merge, and a 1rem bottom
+                         pad is exactly how a compact plan row ends up painted
+                         *through* the todo bar. The extra 1.5rem is the air
+                         above the island: a plan card, a todo line, or a
+                         question on top of the composer all grow
+                         `--composer-height`, but their `shadow-lg` still
+                         paints outside the measured box. The island's own
+                         `pt-3` keeps that blur off the last turn. */
+                      className="scroll-pb-[calc(var(--composer-height,7rem)+1.5rem)] pt-14 pb-[calc(var(--composer-height,7rem)+1.5rem)]"
+                      messages={listMessages}
+                      /* One mounted list shows every chat in turn: the key is
+                         what resets the scroller's follow state on a switch. */
+                      conversationKey={activeId}
+                      isGenerating={isGenerating}
+                      generationStage={activeRun?.stage ?? "idle"}
+                      generationLabel={activeRun?.status}
+                      // A backend status line carries its own clock (Ollama's
+                      // "Loading … · 24s"); the indicator's runs otherwise.
+                      generationStartedAt={
+                        activeRun?.status ? undefined : activeRun?.startedAt
+                      }
+                      onEditMessage={handleEditMessage}
+                      onAskAnswer={handleAskAnswer}
+                      onPlanBuild={planBuild}
+                      /* The plan is read in the panel, so the transcript row
+                         collapses to its header and becomes the way back to
+                         it — one plan, one copy, one Build button. */
+                      onPlanOpen={handlePlanOpen}
+                      onOpenFile={handleOpenFile}
+                      onChangeFileClick={handleChangeFileClick}
+                      onFileReferenceClick={handleFileReferenceClick}
+                      onReviewChanges={handleReviewChanges}
+                      resolveFileUrl={resolveFileUrl}
+                      fileActions={fileActions}
+                      onQuote={handleQuote}
+                      onViewAction={handleViewAction}
+                      renderActions={(message) =>
+                        message.sender === "assistant" ? (
+                          <>
+                            {/* Attached to the turn it explains, through the
+                                list's own render slot — the vendored component
+                                knows nothing about handoffs. */}
+                            {(message as StoredMessage).metadata?.handoff ? (
+                              <HandoffNotice
+                                handoff={
+                                  (message as StoredMessage).metadata!.handoff!
+                                }
+                              />
+                            ) : null}
+                            <MessageActions
+                              message={message as StoredMessage}
+                              providerName={providerName(
+                                (message as StoredMessage).metadata?.providerId ??
+                                  ""
+                              )}
+                              onRegenerate={handleRegenerate}
+                              onDelete={handleDeleteMessage}
+                              /* Only a chat with a folder has a worktree to put
+                                 back; the row itself appears only for a turn
+                                 that actually captured a checkpoint. */
+                              onRestoreCheckpoint={
+                                activeFolder ? confirmRestoreTurn : undefined
+                              }
+                            />
+                          </>
+                        ) : null
+                      }
+                    />
+                  )}
+
+                  <div
+                    ref={composerBoxRef}
+                    data-slot="chat-composer"
+                    className={cn(
+                      "w-full shrink-0",
+                      // An island over the conversation, not a band beside it:
+                      // the wrapper spans the pane so the composer stays centred,
+                      // but only its children take the pointer, which leaves the
+                      // transcript scrollable right up to the window's edge.
+                      !isEmptyChat &&
+                        "pointer-events-none absolute inset-x-0 bottom-0 z-20 pt-3 before:pointer-events-none before:absolute before:inset-x-0 before:top-0 before:h-3 before:bg-gradient-to-b before:from-transparent before:to-background [&>*]:pointer-events-auto"
+                    )}
+                  >
+                    {isEmptyChat ? (
+                      /* Aligned with the composer card's own measure, so the two
+                         read as one control rather than two stacked ones. */
+                      <div className="mx-auto flex w-full max-w-3xl px-3 pb-2 sm:px-4">
+                        <FolderPicker
+                          variant="inline"
+                          /* Names the branch when the chat starts in a
+                             worktree of its own. */
+                          title={activeSession?.title}
+                          cwd={activeSession?.cwd}
+                          gitBranch={activeSession?.gitBranch}
+                          onChange={setFolder}
+                        />
+                      </div>
+                    ) : null}
+                    {/* The plan the turn is working through, collapsed to one
+                        line. Keyed by chat so switching threads never carries a
+                        disclosure — or a plan — across. */}
+                    {!agentNav.selected ? (
+                      <TodoPanel
+                        key={activeId}
+                        items={todos}
+                        running={isGenerating}
+                      />
+                    ) : null}
+                    {!agentNav.selected ? <PendingLineComments /> : null}
+                    {agentNav.selected ? (
+                      <div className="mx-auto mb-4 flex max-w-3xl items-center justify-between rounded-xl border border-border bg-background px-4 py-3 text-[12px] text-muted-foreground">
+                        <span>Viewing {agentNav.selected.title}</span>
+                        <button
+                          type="button"
+                          onClick={agentNav.returnToParent}
+                          className="rounded px-2 py-1 text-foreground hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+                        >
+                          Return to main agent
+                        </button>
+                      </div>
+                    ) : (
+                      composer
+                    )}
+                    {isEmptyChat && (settings?.chat.showSuggestions ?? true) ? (
+                      <PromptSuggestions
+                        items={CHAT_SUGGESTIONS}
+                        onSelect={(item) => void send(item.label, [], [])}
+                      />
+                    ) : null}
+                  </div>
+                </div>
+              </ResizablePanel>
+
+              {dockedPanel ? (
+                <>
+                  <ResizableHandle withHandle />
+                  <ResizablePanel
+                    id={PREVIEW_PANEL_ID}
+                    defaultSize={`${previewSize}%`}
+                    minSize={`${MIN_PREVIEW_SIZE}%`}
+                    maxSize={`${MAX_PREVIEW_SIZE}%`}
+                    className="flex min-w-0 flex-col"
+                    style={{ overflow: "hidden" }}
+                  >
+                    {dockedPanel === "changes" ? (
+                      <ChangesPanel
+                        running={isGenerating || sessions.some((session) => session.parentId === activeId && !!runs[session.id])}
+                        sessionId={activeId}
+                        cwd={activeCwd}
+                        chatFiles={chatChanges}
+                        onClose={closeChanges}
+                        onOpenFile={handleChangesFileOpen}
+                        fileActions={fileActions}
+                        className="min-h-0 flex-1 border-l pt-12"
+                      />
+                    ) : dockedPanel === "processes" ? (
+                      <ProcessesPanel
+                        processes={processes}
+                        onStop={stopProcess}
+                        onClose={closeProcesses}
+                        providerName={providerName}
+                        className="min-h-0 flex-1 border-l pt-12"
+                      />
+                    ) : dockedPanel === "plan" && openPlan ? (
+                      <PlanPanel
+                        plan={openPlan.plan}
+                        onBuild={handlePlanBuild}
+                        onClose={closePlan}
+                        busy={isGenerating}
+                        fileActions={fileActions}
+                        onFileClick={handlePlanFileClick}
+                        className="min-h-0 flex-1 border-l pt-12"
+                      />
+                    ) : dockedPreview ? (
+                    <FilePanel
+                      file={dockedPreview}
+                      binary={previewBinary}
+                      notice={previewNotice}
+                      onClose={closePreview}
+                      actions={fileActions}
+                      onCopyPath={handleCopyPath}
+                      onLineComment={panel.handleLineComment}
+                      diffLayout={previewPrefs.layout}
+                      onDiffLayoutChange={setDiffLayout}
+                      wrap={previewPrefs.wrap}
+                      onWrapChange={setWrap}
+                      className="border-l pt-12"
+                    />
+                    ) : null}
+                  </ResizablePanel>
+                </>
+              ) : null}
+            </ResizablePanelGroup>
+
+            {/*
+              Below md the file panel slides over the conversation, like the
+              sidebar — but inside this wrapper, so it stops at the header.
+            */}
+            <div
+              aria-hidden={!overlayPanel}
+              onClick={
+                overlayPanel === "plan"
+                  ? closePlan
+                  : overlayPanel === "changes"
+                    ? closeChanges
+                    : overlayPanel === "processes"
+                      ? closeProcesses
+                      : closePreview
+              }
+              className={cn(
+                "absolute inset-x-0 top-10 bottom-0 z-40 bg-foreground/20 backdrop-blur-[1px] transition-opacity duration-200 motion-reduce:transition-none md:hidden",
+                overlayPanel ? "opacity-100" : "pointer-events-none opacity-0"
+              )}
+            />
+            <div
+              data-slot="chat-file-panel"
+              // Off-canvas when closed: keep it out of the tab order either way.
+              inert={!overlayPanel}
+              className={cn(
+                "absolute top-10 right-0 bottom-0 z-50 w-[min(30rem,100%)] overflow-hidden bg-background shadow-xl",
+                "transition-transform duration-300 ease-in-out motion-reduce:transition-none md:hidden",
+                !overlayPanel && "translate-x-full"
+              )}
+            >
+              {overlayPanel === "changes" ? (
+                <ChangesPanel
+                        running={isGenerating || sessions.some((session) => session.parentId === activeId && !!runs[session.id])}
+                  sessionId={activeId}
+                  cwd={activeCwd}
+                  chatFiles={chatChanges}
+                  onClose={closeChanges}
+                  onOpenFile={handleChangesFileOpen}
+                  fileActions={fileActions}
+                  className="h-full border-l max-sm:[&_[data-slot=changes-panel-map]]:hidden"
+                />
+              ) : overlayPanel === "processes" ? (
+                <ProcessesPanel
+                  processes={processes}
+                  onStop={stopProcess}
+                  onClose={closeProcesses}
+                  providerName={providerName}
+                  className="h-full border-l"
+                />
+              ) : overlayPanel === "plan" && openPlan ? (
+                <PlanPanel
+                  plan={openPlan.plan}
+                  onBuild={handlePlanBuild}
+                  onClose={closePlan}
+                  busy={isGenerating}
+                  fileActions={fileActions}
+                  onFileClick={handlePlanFileClick}
+                  className="h-full border-l"
+                />
+              ) : overlayPreview ? (
+                <FilePanel
+                  file={overlayPreview}
+                  binary={previewBinary}
+                  notice={previewNotice}
+                  onClose={closePreview}
+                  actions={fileActions}
+                  onCopyPath={handleCopyPath}
+                  onLineComment={panel.handleLineComment}
+                  diffLayout={previewPrefs.layout}
+                  onDiffLayoutChange={setDiffLayout}
+                  wrap={previewPrefs.wrap}
+                  onWrapChange={setWrap}
+                  className="border-l"
+                />
+              ) : null}
+            </div>
+          </DiffWorkers>
+        </div>
+      </div>
+
+      {settingsSection ? (
+        /* Over the chat, not instead of it: the conversation below stays
+           mounted, so a turn running while settings are open keeps streaming
+           into it and is there when the panel closes. */
+        <div
+          data-slot="settings-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Settings"
+          className="fixed inset-0 z-50 bg-background pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)]"
+        >
+          <SettingsView
+            dataDir={dataDir}
+            section={settingsSection}
+            onClose={closeSettings}
+            onSessionsCleared={handleSessionsCleared}
+          />
+        </div>
+      ) : null}
+
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        sessions={paletteSessions}
+        activeId={activeId}
+        onSelectSession={selectSession}
+        onNewChat={startNewChat}
+        onRenameSession={startRename}
+        onOpenMessage={openMessage}
+        actions={paletteActions}
+        onOpenSettings={openSettings}
+      />
+
+      {/* Mounted only while open, so the scan behind it starts with the
+          dialog and nothing about it is on the first paint. */}
+      {snoozeTarget ? <SnoozeChatDialog title={snoozeTarget.title} onClose={() => setSnoozeTarget(null)} onSnooze={(until) => snoozeChat(snoozeTarget.id, until)} /> : null}
+      {newChatOpen ? <NewChatDialog
+        open={newChatOpen}
+        onOpenChange={setNewChatOpen}
+        sessions={sessions}
+        recents={settings?.recentFolders ?? []}
+        onSelect={createNewChat}
+      /> : null}
+      {importOpen ? (
+        <ImportDialog
+          open={importOpen}
+          onOpenChange={setImportOpen}
+          onImported={reloadSessions}
+        />
+      ) : null}
+    </div>
+  )
+}

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Entry Agents",
+  "version": "1.0.0",
+  "identifier": "com.entry.agents",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "devUrl": "http://localhost:3000",
+    "beforeBuildCommand": "node scripts/prepare-desktop.mjs",
+    "frontendDist": "./splash"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Entry Agents",
+        "url": "index.html",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true,
+        "resizable": true,
+        "visible": false,
+        "decorations": false,
+        "backgroundColor": "#0b0b0d",
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/thirdbase1/entry-agents/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      },
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM3RjYzQzAyQzlBNUJCMjQKUldRa3U2WEpBanoyTnpmWXZUS0tBT2gxYVl4eFVxNFJWSjh4ckJIckwvVFBPTGFNU2JTMVFpcnAK"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "app", "dmg", "deb", "appimage"],
+    "createUpdaterArtifacts": true,
+    "category": "DeveloperTool",
+    "shortDescription": "Autonomous coding agent workspace connected to Entry platform",
+    "longDescription": "Entry Agents is a local-first desktop chat client and autonomous coding workspace connected to the Entry platform. It bundles its own runtime and runs the app server on 127.0.0.1.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": ["binaries/node"],
+    "windows": {
+      "nsis": {
+        "installerHooks": "./windows/installer-hooks.nsh"
+      }
+    },
+    "resources": ["resources/app"],
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    }
+  }
+}

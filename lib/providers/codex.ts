@@ -1,0 +1,347 @@
+import "server-only"
+
+import type { ModelOption } from "@/components/ui/model-picker"
+import { CodexClient } from "@/lib/codex-client"
+import {
+  sandboxFor,
+  translateCodexNotification,
+  usageFromNotification,
+} from "@/lib/codex-protocol"
+import {
+  OLLAMA_SOURCE,
+  codexProviderOverrides,
+  splitCodexModel,
+} from "@/lib/codex-providers"
+import { hasCodexBinary, hasCodexCredentials } from "@/lib/codex-runtime"
+import { joinModelId } from "@/lib/model-providers/ids"
+import {
+  enabledModelSources,
+  listSourceModels,
+  type ModelSource,
+} from "@/lib/model-providers/server"
+import { hostedEffortModels } from "@/lib/model-reasoning"
+import { fetchOllamaModels, normalizeBaseUrl } from "@/lib/providers/ollama-api"
+import { withPromptContext } from "@/lib/providers/system-prefix"
+import type {
+  AgentProvider,
+  AgentRunOptions,
+  AgentStreamEvent,
+  PermissionMode,
+} from "@/lib/providers/types"
+import type { AppSettings, CodexSettings } from "@/lib/settings/schema"
+import { formatUserRequestInput, USER_REQUEST_WAITING } from "@/lib/turn-requests"
+
+export const CODEX_PROVIDER_ID = "codex"
+const MODES: PermissionMode[] = ["read-only", "edits", "full"]
+const MODELS_FRESH_MS = 5 * 60_000
+const MODELS_FAILED_MS = 30_000
+
+type ModelsCache = { at: number; models: ModelOption[]; error?: unknown }
+const modelsCache = new Map<string, ModelsCache>()
+const modelsInFlight = new Map<string, Promise<ModelOption[]>>()
+
+/** Explicit settings refresh bypasses the normal picker cache, including failures. */
+export function forgetCodexModels() {
+  modelsCache.clear()
+}
+
+/** Emits a completed agent message only when no delta for that item arrived. */
+export function completedAgentMessageText(
+  message: unknown,
+  streamedItemIds: Set<string>,
+): string | undefined {
+  const envelope = message && typeof message === "object" && !Array.isArray(message)
+    ? message as { method?: unknown; params?: unknown }
+    : null
+  if (envelope?.method !== "item/completed") return undefined
+  const params = envelope.params && typeof envelope.params === "object" && !Array.isArray(envelope.params)
+    ? envelope.params as { item?: unknown }
+    : null
+  const item = params?.item && typeof params.item === "object" && !Array.isArray(params.item)
+    ? params.item as { type?: unknown; id?: unknown; text?: unknown }
+    : null
+  if (item?.type !== "agentMessage" || typeof item.id !== "string" || streamedItemIds.has(item.id)) return undefined
+  return typeof item.text === "string" && item.text ? item.text : undefined
+}
+
+function listCodexModels(binPath: string, workspace: string): Promise<ModelOption[]> {
+  const key = `${binPath}\0${workspace}`
+  const cached = modelsCache.get(key)
+  if (cached && Date.now() - cached.at < (cached.error === undefined ? MODELS_FRESH_MS : MODELS_FAILED_MS)) {
+    // A failure is remembered so the next picker open does not start another
+    // app-server, but it is repeated rather than turned into an empty list:
+    // "no models" with no reason is what made a broken install look idle.
+    return cached.error === undefined
+      ? Promise.resolve(cached.models)
+      : Promise.reject(cached.error)
+  }
+  const existing = modelsInFlight.get(key)
+  if (existing) return existing
+  const pending = fetchCodexModels(binPath, workspace)
+    .then((models) => {
+      modelsCache.set(key, { at: Date.now(), models })
+      return models
+    }, (error: unknown) => {
+      modelsCache.set(key, { at: Date.now(), models: [], error })
+      throw error
+    })
+    .finally(() => {
+      modelsInFlight.delete(key)
+    })
+  modelsInFlight.set(key, pending)
+  return pending
+}
+
+async function fetchCodexModels(binPath: string, workspace: string): Promise<ModelOption[]> {
+  const client = CodexClient.spawn(binPath, workspace)
+  try {
+    await client.initialize()
+    const models: ModelOption[] = []
+    let cursor: string | null = null
+    do {
+      const page = await client.request("model/list", { cursor, includeHidden: false }) as { data?: Array<{ id?: string; model?: string; displayName?: string; description?: string }>; nextCursor?: string | null }
+      for (const model of page.data ?? []) {
+        const id = model.model || model.id
+        if (id) models.push({ id, name: model.displayName || id, ...(model.description ? { description: model.description } : null) })
+      }
+      cursor = page.nextCursor ?? null
+    } while (cursor)
+    return models
+  } finally { client.close() }
+}
+
+/** The app's sources' models, as Codex runs them: grouped, composite ids. */
+async function sourceModels(sources: ModelSource[], ollamaBaseUrl: string): Promise<ModelOption[]> {
+  const [local, remote] = await Promise.all([
+    ollamaBaseUrl ? fetchOllamaModels(ollamaBaseUrl).catch(() => []) : Promise.resolve([]),
+    Promise.all(
+      sources.map(async (source) => ({
+        source,
+        // One unreachable endpoint must not empty the whole picker.
+        models: await listSourceModels(source).catch(() => []),
+      }))
+    ),
+  ])
+  return [
+    ...local.map((model) => ({
+      id: joinModelId(OLLAMA_SOURCE, model.id),
+      name: model.name,
+      group: OLLAMA_SOURCE,
+    })),
+    ...remote.flatMap(({ source, models }) =>
+      models.map((model) => ({
+        id: joinModelId(source.slug, model.id),
+        name: model.name,
+        group: source.slug,
+          // Only when the host's catalog states it (`lib/model-context`).
+          ...(model.contextLength ? { contextLength: model.contextLength } : null),
+      }))
+    ),
+  ]
+}
+
+/** The picker's heading for Codex's own models, beside the app's sources. */
+const CODEX_GROUP = "codex"
+
+export function createCodexProvider(
+  settings: CodexSettings,
+  appSettings?: AppSettings
+): AgentProvider {
+  const binPath = settings.binPath.trim()
+  const workspace = settings.workspace.trim() || process.cwd()
+  const detected = () => settings.enabled && hasCodexBinary(binPath)
+  // The app's model providers, handed to Codex as its own (`lib/codex-providers`).
+  const sources = appSettings ? enabledModelSources(appSettings) : []
+  const ollamaBaseUrl =
+    appSettings?.providers.ollama.enabled
+      ? normalizeBaseUrl(appSettings.providers.ollama.baseUrl)
+      : ""
+  const hasSources = sources.length > 0 || !!ollamaBaseUrl
+
+  const listModels = async (): Promise<ModelOption[]> => {
+    if (!detected()) return []
+    const extra = hasSources ? sourceModels(sources, ollamaBaseUrl) : Promise.resolve([])
+    if (!hasCodexCredentials()) return extra
+    if (!hasSources) return listCodexModels(binPath, workspace)
+    const [own, more] = await Promise.all([
+      // Codex's own listing failing (signed out mid-session, a broken
+      // install) must not hide the providers that do not depend on it.
+      listCodexModels(binPath, workspace).catch(() => []),
+      extra,
+    ])
+    return [...own.map((model) => ({ ...model, group: CODEX_GROUP })), ...more]
+  }
+
+  return {
+    async info() {
+      // Never spawn app-server here. `/api/providers` runs on every boot, and
+      // `account/read` is what logs Windows Codex users out in a loop.
+      const present = detected()
+      // Signed out only matters when there is nothing else to run on: a
+      // configured model provider needs no ChatGPT login.
+      const signedOut = present && !hasCodexCredentials() && !hasSources
+      const available = present && !signedOut
+      return {
+        id: CODEX_PROVIDER_ID,
+        name: "Codex",
+        description: hasSources
+          ? `OpenAI Codex app-server with tools in ${workspace} — on its own models or your model providers.`
+          : `OpenAI Codex app-server with tools in ${workspace}.`,
+        capabilities: {
+          tools: true,
+          resume: true,
+          effort: true,
+          vision: false,
+          permissionModes: MODES,
+          defaultPermissionMode: settings.permissionMode,
+        },
+        available,
+        ...(!available ? { unavailableReason: !settings.enabled ? "Disabled in settings" : signedOut ? "Codex is signed out" : binPath ? `No binary at ${binPath}` : "`codex` binary not found on PATH" } : null),
+        configureBinary: process.platform === "win32" && settings.enabled && !hasCodexBinary(binPath),
+      }
+    },
+
+    listModels,
+
+    ...(hasSources
+      ? {
+          async listModelGroups() {
+            return [
+              ...(hasCodexCredentials() ? [{ id: CODEX_GROUP, label: "Codex" }] : []),
+              ...(ollamaBaseUrl ? [{ id: OLLAMA_SOURCE, label: "Ollama" }] : []),
+              ...sources.map((source) => ({ id: source.slug, label: source.name })),
+            ]
+          },
+
+          /**
+           * Codex's own models all reason; a source's model is read off its
+           * id, like every other hosted catalog in the app.
+           */
+          async effortModels() {
+            const models = await listModels()
+            const composite = models.filter((model) => model.group && model.group !== CODEX_GROUP)
+            return [
+              ...models.filter((model) => !model.group || model.group === CODEX_GROUP).map((model) => model.id),
+              ...hostedEffortModels(composite.map((model) => model.id)),
+            ]
+          },
+        }
+      : null),
+
+    async *run(options: AgentRunOptions): AsyncGenerator<AgentStreamEvent> {
+      if (options.signal.aborted) return
+      const cwd = options.cwd?.trim() || workspace
+      const picked = splitCodexModel(options.model || "", sources, !!ollamaBaseUrl)
+      const client = CodexClient.spawn(
+        binPath,
+        cwd,
+        hasSources ? codexProviderOverrides(sources, ollamaBaseUrl) : undefined
+      )
+      const startedAt = Date.now()
+      let threadId = options.sessionId
+      let turnId: string | undefined
+      let usage: ReturnType<typeof usageFromNotification>
+      const agentMessageDeltas = new Set<string>()
+      const abort = () => {
+        if (threadId && turnId) void client.request("turn/interrupt", { threadId, turnId }).catch(() => {})
+        setTimeout(() => client.close(), 750).unref()
+      }
+      options.signal.addEventListener("abort", abort, { once: true })
+      try {
+        await client.initialize()
+        if (options.signal.aborted) return
+        const mode = options.permissionMode ?? settings.permissionMode
+        const approvalPolicy = mode === "edits" ? "on-request" : "never"
+        const threadParams = {
+          model: picked.model || null,
+          // Only for a model from the app's providers: absent, the thread
+          // runs on whatever the user's Codex is configured with.
+          ...(picked.provider ? { modelProvider: picked.provider } : null),
+          cwd,
+          approvalPolicy,
+          approvalsReviewer: "user" as const,
+          sandbox: sandboxFor(mode),
+        }
+        const response = await client.request(
+          threadId ? "thread/resume" : "thread/start",
+          threadId ? { threadId, ...threadParams } : threadParams
+        ) as { thread?: { id?: string } }
+        threadId = response.thread?.id
+        if (!threadId) throw new Error("Codex did not return a thread id")
+        if (options.signal.aborted) return
+        yield { type: "session", sessionId: threadId }
+        if (options.signal.aborted) return
+        const turn = await client.request("turn/start", {
+          threadId,
+          input: [{ type: "text", text: withPromptContext(options.prompt, options), text_elements: [] }],
+          model: picked.model || null,
+          effort: options.effort || null,
+          cwd,
+          approvalPolicy,
+        }) as { turn?: { id?: string } }
+        turnId = turn.turn?.id
+
+        while (!options.signal.aborted) {
+          const message = await client.next()
+          if (!message) throw new Error("Codex app-server exited before completing the turn")
+          if (message.id !== undefined && message.method) {
+            if (message.method === "item/commandExecution/requestApproval" || message.method === "item/fileChange/requestApproval") {
+              yield* handleCodexApproval(message, options, client)
+            } else {
+              client.respondError(message.id, `Entry Agents does not implement ${message.method}`)
+            }
+            continue
+          }
+          const nextUsage = usageFromNotification(message)
+          if (nextUsage) usage = nextUsage
+          if (message.method === "item/agentMessage/delta") {
+            const params = message.params as { itemId?: unknown } | undefined
+            if (typeof params?.itemId === "string") agentMessageDeltas.add(params.itemId)
+          }
+          yield* translateCodexNotification(message)
+          const completedText = completedAgentMessageText(message, agentMessageDeltas)
+          if (completedText) yield { type: "text", text: completedText }
+          if (message.method === "turn/completed") {
+            const params = message.params as { turn?: { status?: string; durationMs?: number } }
+            if (params.turn?.status === "completed") yield { type: "done", sessionId: threadId, durationMs: params.turn.durationMs ?? Date.now() - startedAt, usage }
+            return
+          }
+        }
+      } catch (error) {
+        if (!options.signal.aborted) yield { type: "error", message: error instanceof Error ? error.message : String(error) }
+      } finally {
+        options.signal.removeEventListener("abort", abort)
+        // A turn that ended keeps the background terminals Codex left
+        // running; a stopped one takes the whole tree.
+        if (options.processes && !options.signal.aborted) {
+          options.processes.release(client.child)
+        } else {
+          client.close()
+        }
+      }
+    },
+  }
+}
+
+export async function* handleCodexApproval(message: { id?: number | string; method?: string; params?: unknown }, options: AgentRunOptions, client: Pick<CodexClient, "respond">): AsyncGenerator<AgentStreamEvent> {
+  if (message.id === undefined) return
+  const params = message.params as Record<string, unknown> | undefined
+  const targetId = typeof params?.itemId === "string" ? params.itemId : String(message.id)
+  const itemId = `approval:${targetId}:${message.id}`
+  const file = message.method === "item/fileChange/requestApproval"
+  const request = {
+    id: itemId,
+    kind: "permission" as const,
+    title: file ? "Allow file changes?" : "Allow command?",
+    description: typeof params?.reason === "string" ? params.reason : undefined,
+    options: [{ id: "accept", label: "Allow once", kind: "allow_once" }, { id: "decline", label: "Decline", kind: "reject_once" }],
+    tool: { name: file ? "fileChange" : "command", input: file ? params?.grantRoot : params?.command },
+  }
+  yield { type: "tool", id: itemId, name: "permission", status: "running", input: formatUserRequestInput(request), output: USER_REQUEST_WAITING }
+  const answer = options.askUser ? await options.askUser(request) : { cancelled: true }
+  const available = Array.isArray(params?.availableDecisions) ? params.availableDecisions : undefined
+  const wantsAccept = answer.optionId === "accept"
+  const decision = wantsAccept && (!available || available.includes("accept")) ? "accept" : answer.cancelled ? "cancel" : "decline"
+  client.respond(message.id, { decision })
+  yield { type: "tool", id: itemId, name: "permission", status: decision === "accept" ? "done" : "error", output: decision }
+}

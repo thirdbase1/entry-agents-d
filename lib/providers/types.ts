@@ -1,0 +1,232 @@
+import type { ChildProcess } from "node:child_process"
+
+import type { AgentStreamEvent } from "@/lib/cursor-agent-types"
+import type { ModelOption } from "@/components/ui/model-picker"
+import type { AskUser } from "@/lib/turn-requests"
+
+export type { AgentStreamEvent }
+
+/**
+ * How much of the machine a harness may touch for one turn, in the app's own
+ * vocabulary — each provider maps these onto whatever its backend actually
+ * speaks (ACP permission policies, dsh sandbox levels, cursor-agent's own
+ * ask/plan/agent modes, …).
+ *
+ * `plan` is read-only with an obligation: the harness answers with the change
+ * it would make rather than making it. Only a backend that has such a mode
+ * publishes it — it is not something the app can synthesize out of a policy.
+ */
+export type PermissionMode = "read-only" | "plan" | "edits" | "full"
+
+/** What a provider can do — the UI degrades gracefully per flag. */
+export type ProviderCapabilities = {
+  /** Full agentic runs: tool calls, file edits. */
+  tools: boolean
+  /** Server-side conversation resume via sessionId. */
+  resume: boolean
+  /**
+   * Resumes when it can, but may have to start a fresh backend session in a
+   * chat that already had one (an ACP agent that keeps its sessions in
+   * memory, after its process went away). The chat route then hands it
+   * `history` anyway, for that fresh session's briefing.
+   */
+  historyOnFreshSession?: boolean
+  /** Reasoning-effort selection is meaningful. */
+  effort: boolean
+  /** Accepts image attachments. */
+  vision: boolean
+  /**
+   * Connects the `mcpServers` a turn is handed — so this harness gets the
+   * app's own MCP server: subagents, and the `memory_*` tools.
+   */
+  mcp?: boolean
+  /**
+   * Permission modes this harness can enforce, in the order a picker should
+   * show them. Absent or empty = no user choice: the provider runs under a
+   * fixed policy (its settings, or no tools at all).
+   */
+  permissionModes?: PermissionMode[]
+  /**
+   * What the harness *already* runs under, for a picker to show when the chat
+   * has made no pick of its own — the narrowest of whatever axes constrain it
+   * (approval policy, sandbox). Display only: an unchosen mode is never sent,
+   * so the harness's own settings stay in charge. Absent = unknown.
+   */
+  defaultPermissionMode?: PermissionMode
+  /**
+   * The backend fixes a conversation's mode when the conversation is created,
+   * so a resumed session cannot be moved to another one.
+   *
+   * True only for cursor-agent, and only because of how its CLI spells the
+   * modes: `--mode ask` and `--mode plan` are flags, while the agent that
+   * edits is the *absence* of one — so there is nothing to pass on a resume
+   * that would take a chat back out of ask mode, and the session answers
+   * "I'm in Ask mode, switch to Agent mode" forever. Where this is set, the
+   * mode joins the working folder as part of a stored session's identity:
+   * asking for a different one starts a fresh backend session instead of
+   * resuming a conversation that cannot honour it.
+   */
+  permissionModePerSession?: boolean
+}
+
+export type ProviderInfo = {
+  id: string
+  name: string
+  description: string
+  capabilities: ProviderCapabilities
+  /** False when the backend is unreachable/disabled — shown in pickers. */
+  available: boolean
+  /** Why unavailable, for the UI. */
+  unavailableReason?: string
+  /**
+   * Windows-only: the CLI binary is missing and the picker can open a native
+   * file dialog to locate it. Other unavailability reasons (disabled, no
+   * server) do not set this.
+   */
+  configureBinary?: boolean
+}
+
+export type ChatTurn = {
+  role: "user" | "assistant"
+  content: string
+  /** Base64 image payloads (no `data:` prefix) attached to this turn, for
+   *  providers that replay history — only meaningful when `capabilities.vision`. */
+  images?: string[]
+}
+
+/**
+ * An MCP server a harness should be connected to for one turn — today only
+ * the app's own subagent bridge (`lib/subagents`). Streamable HTTP; the
+ * headers carry the bridge token, so it must never reach argv or a log line
+ * the user did not ask for.
+ */
+export type McpServerConfig = {
+  name: string
+  url: string
+  headers?: Record<string, string>
+  /**
+   * How long the harness may wait on one call before giving up, in ms. A
+   * harness that has its own default (Claude Code's is 60s) needs it raised
+   * for a server whose tools legitimately block.
+   */
+  timeoutMs?: number
+}
+
+export type AgentRunOptions = {
+  prompt: string
+  model: string
+  /**
+   * Durable, cross-chat context about the user — the memory block from
+   * `lib/memory`. Providers with a real system role (Ollama, the
+   * OpenAI-compatible paths) send it as one; the CLI harnesses, which accept a
+   * single prompt string, fence it in front of the prompt via
+   * `withPromptContext`.
+   *
+   * The chat route sends it once per backend conversation for providers with
+   * `capabilities.resume` — repeating it every turn would re-send context the
+   * backend already has — and on every turn for the stateless ones.
+   */
+  standingContext?: string
+  /**
+   * Context about *this turn* — the handoff block from `lib/handoff`: what
+   * other agents did in this chat while the one about to run was away.
+   *
+   * Unlike `standingContext` this rides in front of the current prompt on
+   * every turn it exists, resumed sessions included: a backend that has been
+   * away is precisely the one that does not know what changed. It is never
+   * part of the stored user message.
+   */
+  turnContext?: string
+  /** Provider-side session to resume, if capabilities.resume. */
+  sessionId?: string
+  /**
+   * MCP servers to connect for this turn. A provider that cannot attach one
+   * ignores the field; `claude-code` passes them as `--mcp-config`.
+   */
+  mcpServers?: McpServerConfig[]
+  effort?: string
+  /**
+   * Per-chat override of the harness's configured permission policy. The chat
+   * route only sends it when `capabilities.permissionModes` lists it; absent
+   * means "whatever settings say", which is the behavior every provider had
+   * before this option existed.
+   */
+  permissionMode?: PermissionMode
+  /**
+   * Prior turns of this thread, oldest first, excluding `prompt`.
+   *
+   * Stateless backends (Ollama) have no `sessionId` to resume, so the chat
+   * route replays the stored transcript instead. Providers with
+   * `capabilities.resume` ignore it — the backend already has the context.
+   */
+  history?: ChatTurn[]
+  /** Base64 image payloads (no `data:` prefix) attached to `prompt`, when
+   *  `capabilities.vision`. */
+  images?: string[]
+  /**
+   * Absolute working folder for this run — the chat's own folder, chosen in
+   * the header. Providers that spawn a CLI use it as the process cwd (and so
+   * as the sandbox the agent reads and writes in); ones that do not, ignore it.
+   */
+  cwd?: string
+  /**
+   * Puts one question to the user *while the turn is still running* and waits
+   * for the answer — an ACP `session/request_permission`, a CLI prompting on
+   * stdin. The provider announces what it is waiting for as an ordinary tool
+   * event (`lib/turn-requests`), so the wire protocol grows nothing; the
+   * answer arrives through `POST /api/chat/respond`.
+   *
+   * Absent means there is no interactive channel this turn: a backend with a
+   * configured policy falls back to it, and one that can only ask (pi's
+   * extension dialogs) treats the request as cancelled rather than block, and
+   * says so in the `question` row it publishes for the wait.
+   */
+  askUser?: AskUser
+  /**
+   * The turn's process bookkeeping (`lib/background-processes`). A provider
+   * that spawns its harness per turn calls `release(child)` at a *normal* end
+   * instead of killing the tree, so a dev server or watcher the agent started
+   * survives the turn and is listed under the chat; a stopped turn still
+   * kills the tree. A long-lived harness calls `observe(pid)` instead. Absent
+   * (tests, title generation) means the old behaviour: kill everything.
+   */
+  processes?: TurnProcessScope
+  signal: AbortSignal
+}
+
+export type TurnProcessScope = {
+  release(child: ChildProcess): void
+  observe(pid: number | undefined): void
+}
+
+/**
+ * Server-side provider. Implementations live in lib/providers/*, are
+ * registered in lib/providers/registry.ts, and stream the shared
+ * AgentStreamEvent protocol consumed by the chat UI.
+ */
+export type AgentProvider = {
+  info(): Promise<ProviderInfo>
+  listModels(): Promise<ModelOption[]>
+  run(options: AgentRunOptions): AsyncGenerator<AgentStreamEvent>
+  /**
+   * Ids from `listModels()` that actually accept image input. Only providers
+   * with `capabilities.vision` need to implement this — others are never
+   * asked. Omit it and every model is treated as vision-incapable.
+   */
+  visionModels?(): Promise<string[]>
+  /**
+   * Ids from `listModels()` that the effort control actually reaches — a
+   * model that does not reason, or a transport that cannot carry the
+   * setting, is left out and the composer hides the control for it. Omit it
+   * and every model is taken to accept effort whenever
+   * `capabilities.effort` is set (`lib/model-reasoning`).
+   */
+  effortModels?(): Promise<string[]>
+  /**
+   * Sections for grouped model pickers: `[{ id: sourceSlug, label: sourceName }]`,
+   * matching the `group` each option from `listModels()` carries. Only
+   * providers that serve models from more than one source need it; omit it and
+   * the picker stays a flat list.
+   */
+  listModelGroups?(): Promise<Array<{ id: string; label: string }>>
+}

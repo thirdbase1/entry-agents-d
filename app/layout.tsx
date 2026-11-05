@@ -1,0 +1,127 @@
+import type { Metadata, Viewport } from "next"
+import "./globals.css"
+import { DesktopUpdater } from "@/components/desktop-updater"
+import { ExternalLinks } from "@/components/external-links"
+import { QuitHold } from "@/components/quit-hold"
+import { ThemeProvider } from "@/components/theme-provider"
+import { Toaster } from "@/components/ui/sonner"
+import {
+  APPEARANCE_BOOTSTRAP_SCRIPT,
+  THEME_STYLE_ID,
+  themePresetCss,
+} from "@/lib/theme/apply"
+import { AppearanceProvider } from "@/lib/theme/theme-client"
+import { cn } from "@/lib/utils"
+
+import { themeFontClassName } from "./fonts"
+
+export const metadata: Metadata = {
+  title: {
+    default: "Entry Agents",
+    template: "%s — Entry Agents",
+  },
+  description:
+    "Local-first AI coding agent workspace connected to Entry platform.",
+}
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  interactiveWidget: "resizes-content",
+}
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode
+}>) {
+  return (
+    <html
+      lang="en"
+      suppressHydrationWarning
+      // Every theme font is mounted as a CSS variable; the active theme picks
+      // which one --font-sans / --font-mono point at.
+      className={cn("antialiased", themeFontClassName)}
+    >
+      <head>
+        {/* Every theme preset, keyed by [data-theme] — see lib/theme/apply.ts. */}
+        <style
+          id={THEME_STYLE_ID}
+          dangerouslySetInnerHTML={{ __html: themePresetCss() }}
+        />
+        {/* Stamps the stored preset, contrast level and radius on <html>
+            before first paint. */}
+        <script dangerouslySetInnerHTML={{ __html: APPEARANCE_BOOTSTRAP_SCRIPT }} />
+      </head>
+      <body className="h-full" suppressHydrationWarning>
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="system"
+          enableSystem
+          disableTransitionOnChange
+        >
+          {/* The UI scale lives here, not on <html>: Radix portals render into
+              <body>, so keeping this wrapper the only zoomed box leaves menus
+              and popovers in the same coordinate space as the anchors Floating
+              UI measures. They read --ui-scale (set on <html> by
+              lib/theme/apply.ts, and pre-paint by the bootstrap script) to
+              scale their own content. */}
+          <div className="h-full [zoom:var(--ui-scale,1)]">
+            <AppearanceProvider>{children}</AppearanceProvider>
+          </div>
+        </ThemeProvider>
+        {/* Toasts wear the app's own theme, not sonner's stock palette: the
+            vendored Toaster maps the neutral slots to the popover tokens, and
+            these mix the rich-color slots out of --destructive / --primary so
+            every preset (and dark mode) carries them. Spread order in that
+            component means `style` replaces its own, so the normal slots are
+            repeated here. */}
+        <Toaster
+          position="bottom-right"
+          richColors
+          style={
+            {
+              "--normal-bg": "var(--popover)",
+              "--normal-text": "var(--popover-foreground)",
+              "--normal-border": "var(--border)",
+              "--error-bg":
+                "color-mix(in oklab, var(--destructive) 12%, var(--popover))",
+              "--error-text":
+                "color-mix(in oklab, var(--destructive) 80%, var(--popover-foreground))",
+              "--error-border":
+                "color-mix(in oklab, var(--destructive) 35%, var(--border))",
+              "--success-bg":
+                "color-mix(in oklab, var(--primary) 12%, var(--popover))",
+              "--success-text":
+                "color-mix(in oklab, var(--primary) 80%, var(--popover-foreground))",
+              "--success-border":
+                "color-mix(in oklab, var(--primary) 35%, var(--border))",
+              "--info-bg":
+                "color-mix(in oklab, var(--accent) 60%, var(--popover))",
+              "--info-text": "var(--accent-foreground)",
+              "--info-border":
+                "color-mix(in oklab, var(--accent) 50%, var(--border))",
+              "--warning-bg":
+                "color-mix(in oklab, var(--destructive) 8%, var(--popover))",
+              "--warning-text":
+                "color-mix(in oklab, var(--destructive) 60%, var(--popover-foreground))",
+              "--warning-border":
+                "color-mix(in oklab, var(--destructive) 22%, var(--border))",
+            } as React.CSSProperties
+          }
+        />
+        {/* Renders nothing: schedules the desktop shell's update check for an
+            idle moment after startup. A no-op in a browser tab. */}
+        <DesktopUpdater />
+        {/* Also nothing: in the shell, an external link's click is handed to
+            the system browser, because `target="_blank"` has no window to open
+            into there. A no-op in a browser tab. */}
+        <ExternalLinks />
+        {/* Also nothing, until ⌘Q is pressed while a turn is running: then the
+            shell's close is held open and this asks for the gesture again. */}
+        <QuitHold />
+      </body>
+    </html>
+  )
+}

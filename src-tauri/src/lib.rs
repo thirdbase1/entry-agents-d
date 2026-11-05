@@ -1,0 +1,600 @@
+//! Agent UI desktop shell.
+//!
+//! The web app is not embedded as static files: it is the real Next.js
+//! standalone server, shipped inside the bundle together with a Node runtime
+//! and started as a Tauri sidecar on a free loopback port. The window stays
+//! hidden until that server answers, so the user never sees a blank frame.
+//!
+//! In development (`tauri dev`) the sidecar is skipped entirely — `next dev`
+//! is already running behind `build.devUrl`.
+
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tauri::path::BaseDirectory;
+use tauri::{
+    AppHandle, Emitter, Listener, Manager, RunEvent, Url, WebviewWindow, WindowEvent,
+};
+use tauri_plugin_shell::process::{CommandChild, CommandEvent};
+use tauri_plugin_shell::ShellExt;
+
+/// Path of the Next.js standalone entry point inside the bundled resources.
+/// `bundle.resources` keeps the source-relative layout, hence the prefix.
+const SERVER_ENTRY: &str = "resources/app/server.js";
+
+/// Lightweight route that answers once Next.js has finished booting its router.
+/// It deliberately does not discover providers, which can probe or launch local
+/// services and must never delay the desktop startup gate.
+const HEALTH_PATH: &str = "/api/health";
+
+/// Env var the per-launch token reaches the sidecar through, and the response
+/// header the app server is expected to echo it back in. Together they are
+/// what tells *our* server apart from anything else that may have taken the
+/// port between `free_port` letting go of it and the sidecar binding it.
+const LAUNCH_TOKEN_ENV: &str = "ENTRY_AGENTS_LAUNCH_TOKEN";
+const LAUNCH_HEADER: &str = "x-entry-agents-launch";
+
+/// The compiled capability, reused as the template for the runtime one — see
+/// `grant_remote_origin`.
+const DEFAULT_CAPABILITY: &str = include_str!("../capabilities/default.json");
+
+/// Give up (and show a readable error) if the server is not up by then.
+///
+/// A Windows cold start can synchronously repair PATH before Next accepts its
+/// first request. Its two PowerShell passes may each try `pwsh` and Windows
+/// PowerShell for five seconds, so the timeout must cover that work plus cold
+/// module loading rather than treating a healthy sidecar as failed at 15s.
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Gap between health probes. Small enough that a warm start feels instant.
+const PROBE_INTERVAL: Duration = Duration::from_millis(40);
+
+/// If the server is unusually slow, surface the (dark) splash instead of
+/// leaving the user with no window at all.
+const SPLASH_AFTER: Duration = Duration::from_millis(1200);
+
+/// Number of trailing sidecar log bytes kept for the failure screen.
+const LOG_TAIL_BYTES: usize = 4096;
+
+/// Events the quit hold is built out of (see `lib/desktop.ts` and
+/// `components/quit-hold.tsx`).
+///
+/// `QUIT_HOLD_EVENT` is the page arming the shell; `QUIT_REQUESTED_EVENT` is
+/// the shell handing the gesture back to the page instead of acting on it.
+const QUIT_HOLD_EVENT: &str = "entry-agents://quit-hold";
+const QUIT_REQUESTED_EVENT: &str = "entry-agents://quit-requested";
+/// The page saying it received a `QUIT_REQUESTED_EVENT` and is handling it.
+const QUIT_ACK_EVENT: &str = "entry-agents://quit-ack";
+
+/// How long a held quit waits for the page to acknowledge it. A page that
+/// does not answer in this time is hung — a renderer frozen after the machine
+/// resumed from hibernation is the case that motivated it — and cannot be
+/// asking to stay open, so the quit goes through.
+const QUIT_ACK_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Whether the page has asked for the next quit to be held.
+///
+/// The default is `false`, and that is the whole safety argument: an app whose
+/// shell always intercepted its own close would be unquittable the moment the
+/// page failed to load. The interception exists only while a turn is running,
+/// only because the page said so, and it disarms itself when the page goes
+/// away. Once the page decides the user meant it, it quits through the process
+/// plugin's `exit`, which arrives here as an `ExitRequested` carrying a code
+/// and is therefore never held.
+///
+/// "Disarms itself when the page goes away" covers a page that unloads, not
+/// one that hangs: a frozen renderer runs no cleanup and never answers. So
+/// every forwarded request is numbered and the page acknowledges each one;
+/// a request still unanswered after `QUIT_ACK_TIMEOUT` exits for real.
+#[derive(Default)]
+struct QuitHold {
+    armed: AtomicBool,
+    requested: AtomicU64,
+    acked: AtomicU64,
+}
+
+impl QuitHold {
+    fn armed(&self) -> bool {
+        self.armed.load(Ordering::Relaxed)
+    }
+
+    fn set(&self, armed: bool) {
+        self.armed.store(armed, Ordering::Relaxed);
+    }
+
+    fn ack(&self) {
+        let requested = self.requested.load(Ordering::Relaxed);
+        self.acked.fetch_max(requested, Ordering::Relaxed);
+    }
+}
+
+/// Hands a quit to the page, and quits anyway if the page never answers.
+fn forward_quit(handle: &AppHandle) {
+    let hold = handle.state::<QuitHold>();
+    let request = hold.requested.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = handle.emit(QUIT_REQUESTED_EVENT, ());
+    let handle = handle.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(QUIT_ACK_TIMEOUT);
+        if handle.state::<QuitHold>().acked.load(Ordering::Relaxed) < request {
+            handle.state::<Sidecar>().kill();
+            handle.exit(0);
+        }
+    });
+}
+
+/// Owns the Node child process. Managed state, so it is killed on app exit
+/// (explicitly on close/exit events, and via `Drop` as a backstop).
+#[derive(Default)]
+struct Sidecar(Mutex<Option<CommandChild>>);
+
+impl Sidecar {
+    fn store(&self, child: CommandChild) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(child);
+        }
+    }
+
+    fn kill(&self) {
+        let child = self.0.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(child) = child {
+            let _ = child.kill();
+        }
+    }
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Rolling tail of the sidecar's stdout/stderr, shown if startup fails.
+#[derive(Clone, Default)]
+struct LogTail(Arc<Mutex<String>>);
+
+impl LogTail {
+    fn push(&self, line: &str) {
+        if let Ok(mut buf) = self.0.lock() {
+            buf.push_str(line);
+            buf.push('\n');
+            if buf.len() > LOG_TAIL_BYTES {
+                // Keep the tail, trimmed forward to a char boundary.
+                let cut = buf.len() - LOG_TAIL_BYTES;
+                let cut = (cut..buf.len())
+                    .find(|i| buf.is_char_boundary(*i))
+                    .unwrap_or(buf.len());
+                buf.replace_range(..cut, "");
+            }
+        }
+    }
+
+    fn snapshot(&self) -> String {
+        self.0
+            .lock()
+            .map(|buf| buf.trim().to_string())
+            .unwrap_or_default()
+    }
+}
+
+pub fn run() {
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        // OS notifications for "the agent finished while you were elsewhere";
+        // driven from lib/notifications.ts through `window.__TAURI__.notification`.
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_shell::init())
+        // Auto-update. The frontend drives it through the injected
+        // `window.__TAURI__.updater` / `.process` globals (see lib/desktop.ts);
+        // `process` is here only so the app can relaunch into the new build.
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|app| {
+            app.manage(Sidecar::default());
+
+            let window = app
+                .get_webview_window("main")
+                .expect("`main` window is declared in tauri.conf.json");
+
+            app.manage(QuitHold::default());
+            // The page arms and disarms the hold; the payload is a bare JSON
+            // boolean, and anything unparseable disarms rather than sticks.
+            let handle = app.handle().clone();
+            app.listen(QUIT_HOLD_EVENT, move |event| {
+                let armed = serde_json::from_str::<bool>(event.payload()).unwrap_or(false);
+                handle.state::<QuitHold>().set(armed);
+            });
+            let handle = app.handle().clone();
+            app.listen(QUIT_ACK_EVENT, move |_| {
+                handle.state::<QuitHold>().ack();
+            });
+
+            // Closing the window is quitting: there is one window and no tray.
+            // While the hold is armed the close is refused and forwarded to the
+            // page, which either asks for the gesture again or exits for real.
+            let handle = app.handle().clone();
+            window.on_window_event(move |event| {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    if handle.state::<QuitHold>().armed() {
+                        api.prevent_close();
+                        forward_quit(&handle);
+                    }
+                }
+            });
+
+            if tauri::is_dev() {
+                // `beforeDevCommand` already started `next dev`. The window's
+                // configured `index.html` would 404 against the dev server,
+                // so go straight to `build.devUrl`.
+                if let Some(url) = app.config().build.dev_url.clone() {
+                    window.navigate(url)?;
+                }
+                window.show()?;
+            } else if let Err(err) = start_app_server(app.handle().clone(), window.clone()) {
+                // Everything before the spawn — resolving the bundled server,
+                // reserving a port, launching Node — used to propagate out of
+                // `setup`, which aborts the process with no window at all. A
+                // failure the user cannot see is worse than a slow one, so it
+                // gets the same screen the timeout does.
+                show_failure(&window, None, &err.to_string());
+            }
+
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("failed to start the Agent UI shell");
+
+    app.run(|handle, event| match event {
+        // macOS delivers ⌘Q and the application menu's Quit here rather than as
+        // a window close, so the hold has to be honoured on this path too. Only
+        // a user-initiated exit is held: `code` is `Some` exactly when the app
+        // asked to exit itself, which is what the page's own quit does.
+        RunEvent::ExitRequested { code, api, .. } => {
+            if code.is_none() && handle.state::<QuitHold>().armed() {
+                api.prevent_exit();
+                forward_quit(handle);
+                return;
+            }
+            handle.state::<Sidecar>().kill();
+        }
+        RunEvent::Exit => {
+            handle.state::<Sidecar>().kill();
+        }
+        _ => {}
+    });
+}
+
+/// Spawns the bundled Node server and, once it answers, points the window at
+/// it. Returns as soon as the child is running; the wait happens off-thread so
+/// the event loop starts immediately.
+fn start_app_server(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let port = free_port()?;
+    let server = app.path().resolve(SERVER_ENTRY, BaseDirectory::Resource)?;
+    let app_dir = server
+        .parent()
+        .ok_or("bundled server.js has no parent directory")?
+        .to_path_buf();
+
+    // Opened before the spawn so a startup failure reports the path that was
+    // actually resolved, rather than only what Node made of it.
+    let log = LogTail::default();
+    log.push(&format!("server entry: {}", server.display()));
+    if !server.is_file() {
+        log.push(&format!(
+            "no file at that path — expected the bundle to carry {SERVER_ENTRY}"
+        ));
+    }
+
+    // Node is given the bare file name resolved against `current_dir`, never
+    // the absolute path. An absolute Windows path carries a drive prefix, and
+    // as the main-module argument it can end up read as drive-relative — Node
+    // then resolves the root alone (`C:`) and dies in `realpathSync` before it
+    // ever reaches server.js.
+    let entry = server
+        .file_name()
+        .ok_or("bundled server.js has no file name")?
+        .to_os_string();
+
+    // Minted per launch (or inherited, which is what makes it pinnable while
+    // debugging) and handed to the server so it can prove it is the process we
+    // started when we come knocking on the port.
+    let token = std::env::var(LAUNCH_TOKEN_ENV).unwrap_or_else(|_| launch_token());
+
+    let (mut events, child) = app
+        .shell()
+        .sidecar("node")?
+        .arg(&entry)
+        .current_dir(&app_dir)
+        .env("PORT", port.to_string())
+        .env("HOSTNAME", "127.0.0.1")
+        .env("NODE_ENV", "production")
+        .env("NEXT_TELEMETRY_DISABLED", "1")
+        .env(LAUNCH_TOKEN_ENV, &token)
+        .spawn()?;
+
+    // Explicit kills cover a quit; this covers everything else. The NSIS
+    // installer and the updater end the shell with TerminateProcess, which
+    // runs no exit handler, and an orphaned node.exe then holds its own file
+    // open — the next install fails with "Error opening file for writing".
+    #[cfg(windows)]
+    if let Some(job) = kill_on_close::tie_to_shell(child.pid()) {
+        app.manage(job);
+    }
+
+    app.state::<Sidecar>().store(child);
+
+    // The sidecar event channel is bounded: leaving it unread would stall the
+    // child once its stdout pipe fills. Drain it and keep the tail for errors.
+    std::thread::spawn({
+        let log = log.clone();
+        move || {
+            while let Some(event) = events.blocking_recv() {
+                match event {
+                    CommandEvent::Stdout(line) | CommandEvent::Stderr(line) => {
+                        log.push(String::from_utf8_lossy(&line).trim_end());
+                    }
+                    CommandEvent::Error(err) => log.push(&err),
+                    CommandEvent::Terminated(payload) => {
+                        log.push(&format!("server exited with code {:?}", payload.code));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let mut splash_shown = false;
+
+        loop {
+            if probe(port, &token) {
+                break;
+            }
+            if started.elapsed() >= READY_TIMEOUT {
+                show_failure(&window, Some(port), &log.snapshot());
+                return;
+            }
+            if !splash_shown && started.elapsed() >= SPLASH_AFTER {
+                splash_shown = true;
+                let _ = window.show();
+            }
+            std::thread::sleep(PROBE_INTERVAL);
+        }
+
+        // The webview only gets the shell's own commands on the origin it is
+        // about to load, and only once that origin is known.
+        if let Err(err) = grant_remote_origin(&app, port) {
+            show_failure(&window, Some(port), &err.to_string());
+            return;
+        }
+
+        match Url::parse(&format!("http://127.0.0.1:{port}/")) {
+            Ok(url) => {
+                if let Err(err) = window.navigate(url) {
+                    show_failure(&window, Some(port), &err.to_string());
+                    return;
+                }
+            }
+            Err(err) => {
+                show_failure(&window, Some(port), &err.to_string());
+                return;
+            }
+        }
+
+        // Both the splash and the window background are the app's dark
+        // neutral, so revealing here cannot flash white. Focus only a window
+        // that is appearing now: once the splash has been up, the user has
+        // had a window to look at and may have gone to another app while a
+        // cold start ran — pulling them back would be stealing focus.
+        let _ = window.show();
+        if !splash_shown {
+            let _ = window.set_focus();
+        }
+    });
+
+    Ok(())
+}
+
+/// Reserves a loopback port by binding to :0 and immediately releasing it.
+fn free_port() -> std::io::Result<u16> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+/// Per-launch identity for the bundled server. Not a credential — it never
+/// leaves this machine and guards nothing but "is this listener ours" — so it
+/// is drawn from the OS entropy `RandomState` is already seeded with rather
+/// than pulling a random-number crate into the shell for it.
+fn launch_token() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let pid = u128::from(std::process::id());
+    let mut token = String::with_capacity(32);
+    for salt in 0..2u128 {
+        // A fresh RandomState per half: each carries its own OS-seeded keys.
+        let half = RandomState::new().hash_one(nanos ^ (pid << 64) ^ salt);
+        token.push_str(&format!("{half:016x}"));
+    }
+    token
+}
+
+/// True once the server returns any HTTP status line — a 500 from the health
+/// route still means Next.js is listening and routing, which is what we wait
+/// for. Connection refused / timeout is the "not ready yet" signal.
+///
+/// The port was picked by binding `:0` and letting go again, so between that
+/// and the sidecar's own bind anything on this machine could have taken it.
+/// A response that carries `x-entry-agents-launch` therefore has to carry *our*
+/// token: a stranger's server is never adopted, and never navigated to.
+fn probe(port: u16, token: &str) -> bool {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+
+    let request = format!(
+        "GET {HEALTH_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut status = String::new();
+    if reader.read_line(&mut status).is_err() || !status.starts_with("HTTP/1.") {
+        return false;
+    }
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case(LAUNCH_HEADER) {
+            return value.trim() == token;
+        }
+    }
+
+    // No header at all is not our server: the lightweight route behind
+    // HEALTH_PATH echoes the token on every answer, so a silent listener is
+    // whatever else took
+    // the port between `free_port` and the sidecar binding it.
+    false
+}
+
+/// Hands the shell's own commands to exactly the origin the sidecar ended up
+/// on. `capabilities/default.json` can only name the dev server statically —
+/// the production port is not known until launch — and a `127.0.0.1:*` grant
+/// there would offer `shell:allow-open` and the window controls to anything
+/// else listening on loopback. The permission list is not duplicated here: the
+/// compiled capability is re-read and only its identity and `remote.urls` are
+/// rewritten.
+fn grant_remote_origin(app: &AppHandle, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let mut capability: serde_json::Value = serde_json::from_str(DEFAULT_CAPABILITY)?;
+    let fields = capability
+        .as_object_mut()
+        .ok_or("capabilities/default.json is not an object")?;
+    fields.insert("identifier".into(), serde_json::json!("app-server"));
+    fields.insert(
+        "remote".into(),
+        serde_json::json!({ "urls": [format!("http://127.0.0.1:{port}")] }),
+    );
+    app.add_capability(serde_json::to_string(&capability)?)?;
+    Ok(())
+}
+
+/// Reveals the window with a readable error instead of hanging invisibly.
+/// `port` is `None` when the failure happened before there was one — nothing
+/// was ever listening, so the timeout wording would be a lie.
+fn show_failure(window: &WebviewWindow, port: Option<u16>, detail: &str) {
+    let detail = if detail.is_empty() {
+        "The server produced no output.".to_string()
+    } else {
+        detail.to_string()
+    };
+    let message = match port {
+        Some(port) => format!(
+            "The bundled server did not answer on http://127.0.0.1:{port} within {}s.\n\n{detail}",
+            READY_TIMEOUT.as_secs()
+        ),
+        None => format!("The bundled server could not be started.\n\n{detail}"),
+    };
+    if let Ok(json) = serde_json::to_string(&message) {
+        let _ = window.eval(format!("window.__agentUiError({json})"));
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+/// Windows: the sidecar dies with the shell, however the shell dies.
+///
+/// The process is put in a job object with `KILL_ON_JOB_CLOSE`, and the only
+/// handle to that job is held by the shell until it exits — at which point
+/// Windows closes it and terminates what is inside. That includes the
+/// `TerminateProcess` an installer or updater ends the shell with, where no
+/// `RunEvent::Exit` ever runs.
+///
+/// `SILENT_BREAKAWAY_OK` keeps the job to Node alone: what *Node* starts — an
+/// agent CLI, `ollama serve` — is not placed in it, so their lifetimes stay
+/// exactly what the app server already decides they are.
+#[cfg(windows)]
+mod kill_on_close {
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    /// Held in managed state for the life of the app; never closed by hand.
+    /// The handle is never read — holding it open is its whole purpose.
+    #[allow(dead_code)]
+    pub struct Job(HANDLE);
+
+    // A job handle is a kernel handle: usable from any thread.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    pub fn tie_to_shell(pid: u32) -> Option<Job> {
+        // SAFETY: plain Win32 calls on handles this function owns; every
+        // failure path closes what it opened.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            limits.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+            let configured = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const c_void,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            let assigned = !process.is_null()
+                && configured != 0
+                && AssignProcessToJobObject(job, process) != 0;
+            if !process.is_null() {
+                CloseHandle(process);
+            }
+            if assigned {
+                Some(Job(job))
+            } else {
+                CloseHandle(job);
+                None
+            }
+        }
+    }
+}

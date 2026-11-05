@@ -1,0 +1,375 @@
+import "server-only"
+
+import type { ModelOption } from "@/components/ui/model-picker"
+import { loopbackConnectUrls } from "@/lib/host-classification"
+import { looksReasoningCapableId } from "@/lib/model-reasoning"
+import {
+  architectureContextLength,
+  configuredOllamaNumCtx,
+  servedOllamaContext,
+} from "@/lib/ollama-context"
+
+/**
+ * The bits of the Ollama HTTP API shared by the two providers that talk to it:
+ * `ollama` (plain chat) and `pi` (the agent harness, which only needs the model
+ * list and the reachability probe — the completions themselves go through the
+ * pi CLI).
+ */
+
+const PROBE_MS = 1_500
+/** Availability is probed per request; a short cache keeps pickers snappy. */
+const PROBE_CACHE_MS = 10_000
+
+export type OllamaModel = {
+  id: string
+  name: string
+  family?: string
+  quantization?: string
+  parameterSize?: string
+  sizeBytes?: number
+}
+
+type TagsResponse = {
+  models?: Array<{
+    name?: string
+    model?: string
+    size?: number
+    details?: {
+      family?: string
+      parameter_size?: string
+      quantization_level?: string
+    }
+  }>
+}
+
+type PsResponse = {
+  models?: Array<{
+    name?: string
+    model?: string
+    /** The window this instance was loaded with, not the architecture's max. */
+    context_length?: number
+  }>
+}
+
+const probeCache = new Map<string, { at: number; ok: boolean }>()
+
+type ShowResponse = {
+  capabilities?: unknown
+  /** Architecture-prefixed metadata, e.g. `qwen35.context_length`. */
+  model_info?: Record<string, unknown>
+  /** Modelfile `PARAMETER`s — text on older servers, an object on newer ones. */
+  parameters?: unknown
+  modelfile?: string
+}
+
+type ModelDetails = {
+  capabilities: string[] | null
+  /** The architecture's maximum, which is not what the runtime serves. */
+  contextLength?: number
+  /** `num_ctx` from the Modelfile, when it set one. */
+  configuredContext?: number
+}
+
+/** Family/name substrings for servers too old to report `/api/show` capabilities. */
+const VISION_HINTS = [
+  "llava",
+  "bakllava",
+  "moondream",
+  "minicpm-v",
+  "qwen2-vl",
+  "qwen2.5vl",
+  "qwen2.5-vl",
+  "pixtral",
+  "llama3.2-vision",
+  "llama4",
+  "gemma3",
+  "granite3.2-vision",
+  "cogvlm",
+]
+const VISION_HINT_PATTERN = /(^|[^a-z0-9])(vl|vision)([^a-z0-9]|$)/
+
+/**
+ * The same hints against a bare model id, for catalogs that report no
+ * modality at all. Every OpenAI-compatible `/v1/models` is one of those: it
+ * answers with ids and nothing else, so a hosted model that takes images can
+ * only be recognised by saying so in its name (`…-vision-exp`, `…-vl`). Weaker
+ * evidence than `/api/show`, and treated as such — it is the *only* thing on
+ * offer for a hosted source, never a substitute where a real answer exists.
+ */
+export function looksVisionCapableId(id: string) {
+  const haystack = id.toLowerCase()
+  return (
+    VISION_HINTS.some((hint) => haystack.includes(hint)) ||
+    VISION_HINT_PATTERN.test(haystack)
+  )
+}
+
+/** Cheap fallback when `/api/show` doesn't report capabilities: family/name hints. */
+export function looksVisionCapable(model: OllamaModel) {
+  return looksVisionCapableId(`${model.family ?? ""} ${model.id}`)
+}
+
+const SHOW_MS = 2_000
+/**
+ * `/api/show` is one request per model and both the vision probe and the
+ * context-window lookup want it. Models change when the user pulls or removes
+ * one, so a short memo keeps a picker refresh to a single sweep.
+ */
+const SHOW_CACHE_MS = 30_000
+
+const showCache = new Map<string, { at: number; details: ModelDetails }>()
+
+const NO_DETAILS: ModelDetails = { capabilities: null }
+
+/** What `/api/show` knows about one model; capabilities are `null` on failure. */
+async function fetchModelDetails(
+  baseUrl: string,
+  model: string
+): Promise<ModelDetails> {
+  const root = normalizeBaseUrl(baseUrl)
+  const key = `${root}|${model}`
+  const cached = showCache.get(key)
+  if (cached && Date.now() - cached.at < SHOW_CACHE_MS) return cached.details
+  let details = NO_DETAILS
+  try {
+    const res = await fetch(`${root}/api/show`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(SHOW_MS),
+    })
+    if (res.ok) {
+      const data = (await res.json()) as ShowResponse
+      details = {
+        capabilities: Array.isArray(data.capabilities)
+          ? data.capabilities.filter((c): c is string => typeof c === "string")
+          : null,
+        contextLength: architectureContextLength(data.model_info),
+        configuredContext: configuredOllamaNumCtx(data),
+      }
+    }
+  } catch {
+    details = NO_DETAILS
+  }
+  showCache.set(key, { at: Date.now(), details })
+  return details
+}
+
+/**
+ * The largest context this model's weights allow, or undefined when the server
+ * will not say.
+ *
+ * A *ceiling*, not what the model is being served with: Ollama picks the
+ * window at load time and defaults to 4096 however large the architecture is,
+ * which is why a long request gets a 400 naming a context the model plainly
+ * has more of. `lib/completion.ts` reads this to ask for a bigger one.
+ */
+export async function fetchOllamaModelContext(
+  baseUrl: string,
+  model: string
+): Promise<number | undefined> {
+  return (await fetchModelDetails(baseUrl, model)).contextLength
+}
+
+/**
+ * Which of these models take image input. `/api/show` is authoritative on
+ * Ollama servers new enough to report `capabilities`; older servers fall
+ * back to a family/name heuristic. Probed in parallel and best-effort — a
+ * slow or failing model just drops out of the list rather than failing the
+ * whole page.
+ */
+export async function fetchVisionCapableModelIds(
+  baseUrl: string,
+  models: OllamaModel[]
+): Promise<string[]> {
+  const checks = await Promise.all(
+    models.map(async (model) => {
+      const { capabilities } = await fetchModelDetails(baseUrl, model.id)
+      const vision = capabilities
+        ? capabilities.includes("vision")
+        : looksVisionCapable(model)
+      return vision ? model.id : null
+    })
+  )
+  return checks.filter((id): id is string => id !== null)
+}
+
+/**
+ * Which of these models think — `/api/show` lists `thinking` among the
+ * capabilities of every model Ollama will pass `think` to. A server too old to
+ * report capabilities falls back to the id (`lib/model-reasoning`), the same
+ * trade the vision probe above makes.
+ */
+export async function fetchThinkingCapableModelIds(
+  baseUrl: string,
+  modelIds: string[]
+): Promise<string[]> {
+  const checks = await Promise.all(
+    modelIds.map(async (id) => {
+      const { capabilities } = await fetchModelDetails(baseUrl, id)
+      const thinks = capabilities ? capabilities.includes("thinking") : looksReasoningCapableId(id)
+      return thinks ? id : null
+    })
+  )
+  return checks.filter((id): id is string => id !== null)
+}
+
+/**
+ * The context window each of these models would actually be served with.
+ *
+ * Three numbers disagree here, and only one of them predicts the 400 a long
+ * request gets back. `/api/ps` reports the window a *loaded* model is running
+ * with — the real one. An unloaded model falls back to `num_ctx` from its
+ * Modelfile, then to Ollama's 4096 default. The architecture's maximum from
+ * `/api/show` (`qwen35.context_length` = 256k) is a ceiling, not a promise,
+ * and must not reach the composer's meter.
+ */
+export async function fetchOllamaContextLengths(
+  baseUrl: string,
+  models: OllamaModel[]
+): Promise<Record<string, number>> {
+  const loaded = await fetchLoadedOllamaContexts(baseUrl)
+  const entries = await Promise.all(
+    models.map(async (model) => {
+      const running = loaded[model.id]
+      if (running) return [model.id, running] as const
+      const { configuredContext } = await fetchModelDetails(baseUrl, model.id)
+      return [
+        model.id,
+        servedOllamaContext({ configured: configuredContext }),
+      ] as const
+    })
+  )
+  return Object.fromEntries(entries)
+}
+
+/** Trailing slashes make every joined path double up — strip them once here. */
+export function normalizeBaseUrl(raw: string) {
+  return loopbackConnectUrls(raw)[0] ?? raw.trim().replace(/\/+$/, "")
+}
+
+/** Never throws — an unreachable server is a UI state, not an error. */
+export async function probeOllama(baseUrl: string) {
+  const cached = probeCache.get(baseUrl)
+  if (cached && Date.now() - cached.at < PROBE_CACHE_MS) return cached.ok
+  let ok = false
+  for (const candidate of loopbackConnectUrls(baseUrl)) {
+    try {
+      const res = await fetch(`${candidate}/api/tags`, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(PROBE_MS),
+      })
+      if (res.ok) {
+        ok = true
+        break
+      }
+    } catch {
+      /* try the next loopback spelling */
+    }
+  }
+  probeCache.set(baseUrl, { at: Date.now(), ok })
+  return ok
+}
+
+export async function fetchOllamaModels(
+  baseUrl: string
+): Promise<OllamaModel[]> {
+  const root = normalizeBaseUrl(baseUrl)
+  const res = await fetch(`${root}/api/tags`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(5_000),
+  })
+  if (!res.ok) throw new Error(`Ollama /api/tags failed (${res.status})`)
+  const data = (await res.json()) as TagsResponse
+  return (data.models ?? [])
+    .map((entry): OllamaModel | null => {
+      const id = entry.model || entry.name
+      if (!id) return null
+      return {
+        id,
+        name: entry.name ?? id,
+        family: entry.details?.family,
+        quantization: entry.details?.quantization_level,
+        parameterSize: entry.details?.parameter_size,
+        sizeBytes: entry.size,
+      }
+    })
+    .filter((model): model is OllamaModel => model !== null)
+}
+
+/**
+ * Models Ollama currently holds in memory (`/api/ps`).
+ *
+ * This is what separates "the model is thinking" from "the model is still
+ * being read off disk": a cold 8B model can take a minute before it emits a
+ * single token, and that minute is worth naming. Never throws — an unanswered
+ * probe just means we cannot promise either way.
+ */
+export async function fetchLoadedOllamaModels(
+  baseUrl: string
+): Promise<string[]> {
+  return (await fetchRunning(baseUrl))
+    .map((entry) => entry.model || entry.name)
+    .filter((id): id is string => !!id)
+}
+
+/** Loaded model id → the context window it was actually loaded with. */
+async function fetchLoadedOllamaContexts(
+  baseUrl: string
+): Promise<Record<string, number>> {
+  const loaded: Record<string, number> = {}
+  for (const entry of await fetchRunning(baseUrl)) {
+    const window = entry.context_length
+    if (typeof window !== "number" || window <= 0) continue
+    // `/api/tags` and `/api/ps` disagree on `name` vs `model` for some tags.
+    if (entry.model) loaded[entry.model] = window
+    if (entry.name) loaded[entry.name] = window
+  }
+  return loaded
+}
+
+async function fetchRunning(
+  baseUrl: string
+): Promise<NonNullable<PsResponse["models"]>> {
+  try {
+    const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/ps`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(PROBE_MS),
+    })
+    if (!res.ok) return []
+    const data = (await res.json()) as PsResponse
+    return data.models ?? []
+  } catch {
+    return []
+  }
+}
+
+export function toModelOption(
+  model: OllamaModel,
+  contextLength?: number
+): ModelOption {
+  return {
+    id: model.id,
+    name: model.name,
+    badge: model.family,
+    description: model.quantization,
+    meta: [model.parameterSize, formatSize(model.sizeBytes)]
+      .filter(Boolean)
+      .join(" · "),
+    ...(contextLength ? { contextLength } : null),
+  }
+}
+
+export function ollamaReachErrorMessage(err: unknown, baseUrl: string) {
+  const message = err instanceof Error ? err.message : String(err)
+  return /fetch failed|ECONNREFUSED/i.test(message)
+    ? `Could not reach Ollama at ${baseUrl}`
+    : message
+}
+
+function formatSize(bytes?: number) {
+  if (!bytes || bytes <= 0) return undefined
+  const gb = bytes / 1024 ** 3
+  return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`
+}

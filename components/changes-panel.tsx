@@ -1,0 +1,382 @@
+"use client"
+
+import { FileWarning, GitCompare, PanelLeft, RefreshCw, X } from "lucide-react"
+import * as React from "react"
+
+import { CommitControl } from "@/components/commit-control"
+import { pollable, refreshFolderStatus, useFolderStatus } from "@/components/folder-status"
+import type {
+  ChangeSummaryFile,
+  FileActionItem,
+} from "@/components/ui/change-summary"
+import { DiffStack, type DiffStackFile } from "@/components/ui/diff-view"
+import {
+  FileTree,
+  type FileTreeEntry,
+  type FileTreeStatus,
+} from "@/components/ui/file-tree"
+import * as api from "@/lib/api-client"
+import { cn } from "@/lib/utils"
+
+/**
+ * Everything the chat changed, read the way a review is read: one column of
+ * diffs, one scrollbar, top to bottom.
+ *
+ * The file map is a hideable sidebar beside that column — the same shape as
+ * opening a file next to its tree — so hiding it gives the diffs the width,
+ * and clicking a row still scrolls the stack rather than replacing it.
+ *
+ * The single scroller is the load-bearing part, and it is why the diffs are one
+ * vendored `DiffStack` rather than a column of `DiffView`s: `@pierre/diffs`
+ * virtualizes every file against one container, so the wheel never hits a
+ * boundary halfway down the review and a hundred-file change costs what one
+ * screen costs.
+ */
+
+/** The file map starts open; a review usually begins by looking at the list. */
+const MAP_OPEN_DEFAULT = true
+
+/** Git's own letters on a patch, as the tree's status names. */
+function treeStatus(letter: string): FileTreeStatus {
+  if (letter === "A") return "added"
+  if (letter === "D") return "deleted"
+  if (letter === "?") return "untracked"
+  return "modified"
+}
+
+export function ChangesPanel({
+  sessionId,
+  cwd,
+  chatFiles,
+  running = false,
+  onClose,
+  onOpenFile,
+  fileActions,
+  className,
+}: {
+  sessionId: string
+  /**
+   * The chat's folder. Without one there is no worktree to diff, so the panel
+   * lists `chatFiles` — what the transcript says the turns wrote — and a row
+   * opens that file in the file panel, which reads it from the tool calls.
+   */
+  cwd?: string
+  /** The header's own count: every file the chat's turns changed. */
+  chatFiles?: ChangeSummaryFile[]
+  running?: boolean
+  onClose?: () => void
+  /** A map row's "open on its own" — hands the path to the file panel. */
+  onOpenFile?: (path: string) => void
+  /** Right-click menu on the browser's rows, as everywhere else. */
+  fileActions?: FileActionItem[]
+  className?: string
+}) {
+  const status = useFolderStatus(cwd ?? "", sessionId)
+  const [files, setFiles] = React.useState<api.ChangedFilePatch[] | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
+  const [loading, setLoading] = React.useState(false)
+  const [mapOpen, setMapOpen] = React.useState(MAP_OPEN_DEFAULT)
+  const [focus, setFocus] = React.useState<{ path: string; nonce: number } | null>(
+    null
+  )
+  /**
+   * The map has two jobs, and they are not the same job. "Changed" indexes the
+   * stack beside it — a row scrolls to that file rather than replacing anything.
+   * "Browse folder" is the old popover's other half, kept because a review is
+   * also when you want to open the file *next* to the one that changed; its
+   * rows open in the file panel, which is what that panel is for.
+   */
+  const [browsing, setBrowsing] = React.useState(false)
+
+  /**
+   * Re-read the worktree.
+   *
+   * The spinner is raised in a microtask rather than inline: this runs from an
+   * effect, and a synchronous `setState` in an effect body is the one thing the
+   * hooks rules forbid outright.
+   */
+  const requestRef = React.useRef<AbortController | null>(null)
+  const load = React.useCallback(async (background = false) => {
+    if (!sessionId || !cwd || requestRef.current) return
+    const controller = new AbortController()
+    requestRef.current = controller
+    if (!background) queueMicrotask(() => {
+      if (!controller.signal.aborted) setLoading(true)
+    })
+    try {
+      const next = await api.fetchChangedFiles(sessionId, controller.signal)
+      if (controller.signal.aborted) return
+      setFiles((previous) => JSON.stringify(previous) === JSON.stringify(next) ? previous : next)
+      setError(null)
+    } catch (err) {
+      if (!controller.signal.aborted && !background) {
+        setError(err instanceof Error ? err.message : "Could not read the changes")
+      }
+    } finally {
+      if (requestRef.current === controller) requestRef.current = null
+      if (!controller.signal.aborted) setLoading(false)
+    }
+  }, [cwd, sessionId])
+
+  React.useEffect(() => () => {
+    requestRef.current?.abort()
+    requestRef.current = null
+  }, [load, running])
+
+  // A dirty-file count cannot detect another edit to the same file.
+  const dirty = status?.dirty
+  React.useEffect(() => {
+    let cancelled = false
+    queueMicrotask(() => { if (!cancelled) void load() })
+    return () => { cancelled = true }
+  }, [dirty, load, running])
+  React.useEffect(() => {
+    if (!running || !cwd) return
+    const refresh = () => { if (pollable()) void load(true) }
+    const timer = setInterval(refresh, 2000)
+    window.addEventListener("focus", refresh)
+    return () => {
+      clearInterval(timer)
+      window.removeEventListener("focus", refresh)
+    }
+  }, [cwd, load, running])
+
+  const stack = React.useMemo<DiffStackFile[]>(
+    () =>
+      (files ?? [])
+        .filter((file) => !file.binary && file.patch)
+        .map((file) => ({ path: file.path, patch: file.patch })),
+    [files]
+  )
+
+  const dirtyPaths = React.useMemo(
+    () => (files ?? []).map((file) => file.path),
+    [files]
+  )
+
+  const treeEntries = React.useMemo<FileTreeEntry[]>(
+    () =>
+      cwd
+        ? (files ?? []).map((file) => ({
+            path: file.path,
+            status: treeStatus(file.status),
+            additions: file.insertions,
+            deletions: file.deletions,
+          }))
+        : (chatFiles ?? []).map((file) => ({
+            path: file.path,
+            status: "modified" as const,
+            additions: file.additions,
+            deletions: file.deletions,
+          })),
+    [chatFiles, cwd, files]
+  )
+
+  /**
+   * A row with a diff scrolls the stack to it. A row without one — a PNG the
+   * agent wrote, any other binary file — has nothing in the stack to scroll
+   * to, so it opens in the file panel instead, which shows the picture.
+   */
+  const reveal = React.useCallback(
+    (path: string) => {
+      const file = files?.find((entry) => entry.path === path)
+      // Folderless, every row is one: there is no stack to scroll.
+      if (onOpenFile && (!cwd || (file && (file.binary || !file.patch)))) {
+        onOpenFile(path)
+        return
+      }
+      setFocus((prev) => ({ path, nonce: (prev?.nonce ?? 0) + 1 }))
+    },
+    [cwd, files, onOpenFile]
+  )
+
+  const loadChildren = React.useCallback(
+    async (dir: string) => {
+      if (!sessionId) return []
+      try {
+        const { entries } = await api.listFolderLevel(sessionId, dir)
+        return entries
+      } catch {
+        // A level that could not be read stays closed rather than empty; the
+        // tree asks again the next time it is opened.
+        return []
+      }
+    },
+    [sessionId]
+  )
+
+  const refresh = React.useCallback(() => {
+    if (cwd) refreshFolderStatus(cwd)
+    load()
+  }, [cwd, load])
+
+  return (
+    <aside
+      data-slot="changes-panel"
+      aria-label="Changes in this chat"
+      className={cn("flex h-full min-h-0 flex-col bg-background", className)}
+    >
+      <header
+        data-slot="changes-panel-header"
+        className="flex h-10 shrink-0 items-center gap-1.5 border-b px-2.5 text-[13px]"
+      >
+        <GitCompare className="size-3.5 shrink-0 opacity-70" />
+        <span className="shrink-0 font-medium text-foreground">Changes</span>
+        {(cwd ? files : chatFiles) ? (
+          <span className="shrink-0 text-[11.5px] tabular-nums text-muted-foreground">
+            {(cwd ? files : chatFiles)?.length}
+          </span>
+        ) : null}
+        {status?.branch ? (
+          <span
+            className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground"
+            title={status.branch}
+          >
+            {status.branch}
+          </span>
+        ) : (
+          <span className="min-w-0 flex-1" />
+        )}
+        <button
+          type="button"
+          data-slot="changes-panel-tree-toggle"
+          aria-expanded={mapOpen}
+          aria-label={mapOpen ? "Hide the file tree" : "Show the file tree"}
+          title={mapOpen ? "Hide the file tree" : "Show the file tree"}
+          onClick={() => setMapOpen((open) => !open)}
+          className={ICON_BUTTON}
+        >
+          <PanelLeft />
+        </button>
+        {cwd ? (
+          <button
+            type="button"
+            data-slot="changes-panel-refresh"
+            aria-label="Re-read the changes"
+            title="Re-read the changes"
+            onClick={refresh}
+            className={ICON_BUTTON}
+          >
+            <RefreshCw className={loading ? "animate-spin" : undefined} />
+          </button>
+        ) : null}
+        {onClose ? (
+          <button
+            type="button"
+            data-slot="changes-panel-close"
+            aria-label="Close the changes"
+            title="Close the changes"
+            onClick={onClose}
+            className={ICON_BUTTON}
+          >
+            <X />
+          </button>
+        ) : null}
+      </header>
+
+      <div className="flex min-h-0 flex-1">
+        {mapOpen ? (
+          <div
+            data-slot="changes-panel-map"
+            className="flex w-[13.75rem] shrink-0 flex-col border-r"
+          >
+            {cwd ? (
+              <div
+                role="group"
+                aria-label="File list scope"
+                className="flex shrink-0 items-center gap-0.5 px-2 py-1.5"
+              >
+                <button
+                  type="button"
+                  data-active={!browsing}
+                  onClick={() => setBrowsing(false)}
+                  className={SCOPE}
+                >
+                  Changed
+                </button>
+                <button
+                  type="button"
+                  data-active={browsing}
+                  onClick={() => setBrowsing(true)}
+                  className={SCOPE}
+                >
+                  Browse
+                </button>
+              </div>
+            ) : null}
+            <div className="min-h-0 flex-1">
+              {browsing && cwd ? (
+                <FileTree
+                  loadChildren={loadChildren}
+                  initialExpansion="closed"
+                  onSelect={(path) => onOpenFile?.(path)}
+                  fileActions={fileActions}
+                  label="Folder"
+                  searchPlaceholder="Filter loaded files"
+                  emptyLabel="Nothing to browse here."
+                  className="h-full"
+                />
+              ) : (
+                <FileTree
+                  entries={treeEntries}
+                  selectedPath={focus?.path}
+                  revealNonce={focus?.nonce}
+                  onSelect={reveal}
+                  fileActions={fileActions}
+                  label="Changed files"
+                  search={false}
+                  emptyLabel={
+                    !cwd
+                      ? "Nothing has changed in this chat yet."
+                      : files === null
+                        ? "Reading the worktree…"
+                        : "Nothing has changed in this folder yet."
+                  }
+                  className="h-full"
+                />
+              )}
+            </div>
+          </div>
+        ) : null}
+
+        <div data-slot="changes-panel-body" className="min-h-0 min-w-0 flex-1">
+          {!cwd ? (
+            <p className="px-3 py-2 text-[12.5px] text-muted-foreground">
+              This chat has no folder, so there is no worktree to diff. Pick a
+              file in the list to open what the chat wrote to it.
+            </p>
+          ) : error ? (
+            <p className="flex items-start gap-1.5 px-3 py-2 text-[12.5px] text-muted-foreground">
+              <FileWarning aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+              {error}
+            </p>
+          ) : (
+            <DiffStack
+              files={stack}
+              focusPath={focus?.path}
+              focusNonce={focus?.nonce}
+              emptyLabel={
+                files === null
+                  ? "Reading the worktree…"
+                  : files.length
+                    ? "Every change here is binary or too large to show — pick one in the list to open it."
+                    : "Nothing has changed in this folder yet."
+              }
+              className="h-full"
+            />
+          )}
+        </div>
+      </div>
+
+      {cwd && status?.isGitRepo ? (
+        <CommitControl sessionId={sessionId} cwd={cwd} paths={dirtyPaths} />
+      ) : null}
+    </aside>
+  )
+}
+
+const SCOPE =
+  "rounded-md px-2 py-0.5 text-[11.5px] text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 data-[active=true]:bg-muted data-[active=true]:text-foreground"
+
+const ICON_BUTTON =
+  "inline-grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 [&_svg]:size-3.5"

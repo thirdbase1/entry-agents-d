@@ -1,0 +1,179 @@
+import {
+  sameWorkingFolder,
+  type AgentSessionState,
+  type WorktreeSnapshot,
+} from "@/lib/handoff/types"
+
+/**
+ * The two rules that decide what a chat remembers about an agent, kept pure
+ * and away from the route so they can be reasoned about (and tested) on their
+ * own. Both are easy to get subtly wrong and expensive when they are.
+ */
+
+/**
+ * The backend session to resume, if any.
+ *
+ * The folder is part of the identity: an id minted while the chat pointed at
+ * one checkout resumes a conversation about files that are not in another, so
+ * repointing the chat starts a fresh backend session rather than a confused
+ * one. Changing the *model* is not part of the identity — the same harness
+ * carries on with the same conversation.
+ *
+ * The permission mode joins the folder for the harnesses that cannot change a
+ * live conversation's mode — `mode` is passed only for those, and only they
+ * ever recorded one. cursor-agent is the case that forces this: its `--mode
+ * ask` is a flag and its agent mode is the absence of one, so resuming an ask
+ * session leaves it refusing to edit for the rest of the chat however the
+ * picker is set. A fresh session is the honest answer, and the same one the
+ * folder rule already gives.
+ */
+export function resolveResumeSessionId(
+  entry: AgentSessionState | undefined,
+  cwd: string | undefined,
+  canResume: boolean,
+  mode?: SessionMode
+): string | undefined {
+  if (!canResume || !entry?.providerSessionId) return undefined
+  if (!sameWorkingFolder(entry.cwd, cwd)) return undefined
+  if (mode?.perSession && entry.permissionMode !== mode.permissionMode) {
+    return undefined
+  }
+  return entry.providerSessionId
+}
+
+/**
+ * What this provider's mode means for its stored session: whether the mode is
+ * fixed for a conversation's life, and which one this turn asked for. Absent
+ * where the harness can switch freely, which is every harness but cursor's.
+ */
+export type SessionMode = {
+  perSession: boolean
+  permissionMode?: string
+}
+
+/**
+ * This agent's state after a turn.
+ *
+ * `lastSeenSeq` only moves when the run actually started, and that is the
+ * whole cursor discipline in one line: a spawn failure, a refused connection
+ * or an abort before the backend said anything means the agent never received
+ * the handoff, so the same one must be offered again next turn. Once it has
+ * started, the turn counts even if it then failed or was stopped — its
+ * backend has the prompt either way.
+ */
+export function nextAgentSessionState(args: {
+  previous?: AgentSessionState
+  /** Last seq in the journal after this turn's events were appended. */
+  journalEnd: number
+  /** Whether this turn wrote anything to the journal. */
+  wrote: boolean
+  runStarted: boolean
+  cwd?: string
+  providerSessionId?: string
+  /** This turn's mode, for the harnesses whose sessions are stuck with one. */
+  mode?: SessionMode
+  snapshot?: WorktreeSnapshot
+  now: number
+}): AgentSessionState {
+  const previous = args.previous
+  // The stored id and the worktree it was taken against both belong to the
+  // folder they were minted in — so a turn that produced neither (a spawn that
+  // failed) may only inherit them when the chat still points there. Carrying
+  // them across a repoint is how a later turn resumes a backend session about
+  // another checkout, which `resolveResumeSessionId` exists to prevent.
+  const inherited = sameWorkingFolder(previous?.cwd, args.cwd)
+    ? previous
+    : undefined
+  const providerSessionId =
+    args.providerSessionId || inherited?.providerSessionId || undefined
+  // The mode a stored id was minted under, and only ever beside that id: it is
+  // rewritten when this turn minted one and inherited otherwise, so a turn
+  // that never reached the backend leaves the pair — the id and the mode it
+  // belongs to — exactly as it found it, resumable by the mode that made it.
+  const permissionMode =
+    args.mode?.perSession && args.providerSessionId
+      ? args.mode.permissionMode
+      : inherited?.permissionMode
+  const snapshot = args.snapshot ?? inherited?.snapshot
+  return {
+    ...(providerSessionId ? { providerSessionId } : null),
+    ...(args.cwd ? { cwd: args.cwd } : null),
+    ...(permissionMode ? { permissionMode } : null),
+    lastSeenSeq: args.runStarted
+      ? Math.max(args.journalEnd, previous?.lastSeenSeq ?? 0)
+      : (previous?.lastSeenSeq ?? 0),
+    lastWroteSeq: args.wrote
+      ? Math.max(args.journalEnd, previous?.lastWroteSeq ?? 0)
+      : (previous?.lastWroteSeq ?? 0),
+    lastActiveAt: args.now,
+    ...(snapshot ? { snapshot } : null),
+  }
+}
+
+/**
+ * Per-provider state read back from an index file, migrating one written
+ * before it existed: a lone `providerSessionId` belonged to whichever
+ * provider the chat last used, so it becomes that provider's entry — with a
+ * zero journal cursor, which is right, because nothing was journaled then.
+ */
+export function migrateAgentSessions(
+  raw: unknown,
+  legacy: {
+    providerId: string
+    providerSessionId: string
+    cwd?: string
+    updatedAt: number
+  }
+): Record<string, AgentSessionState> | undefined {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const entries: Record<string, AgentSessionState> = {}
+    for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (!id || !value || typeof value !== "object") continue
+      const state = value as Record<string, unknown>
+      entries[id] = {
+        ...(typeof state.providerSessionId === "string" &&
+        state.providerSessionId
+          ? { providerSessionId: state.providerSessionId }
+          : null),
+        ...(typeof state.cwd === "string" ? { cwd: state.cwd } : null),
+        ...(typeof state.permissionMode === "string" && state.permissionMode
+          ? { permissionMode: state.permissionMode }
+          : null),
+        lastSeenSeq: asCount(state.lastSeenSeq),
+        lastWroteSeq: asCount(state.lastWroteSeq),
+        lastActiveAt:
+          typeof state.lastActiveAt === "number" ? state.lastActiveAt : 0,
+        ...(readSnapshot(state.snapshot) ?? null),
+      }
+    }
+    return Object.keys(entries).length > 0 ? entries : undefined
+  }
+  if (!legacy.providerId || !legacy.providerSessionId) return undefined
+  return {
+    [legacy.providerId]: {
+      providerSessionId: legacy.providerSessionId,
+      ...(legacy.cwd ? { cwd: legacy.cwd } : null),
+      lastSeenSeq: 0,
+      lastWroteSeq: 0,
+      lastActiveAt: legacy.updatedAt,
+    },
+  }
+}
+
+function readSnapshot(raw: unknown) {
+  if (!raw || typeof raw !== "object") return null
+  const value = raw as Record<string, unknown>
+  if (typeof value.head !== "string" || !Array.isArray(value.status)) return null
+  return {
+    snapshot: {
+      head: value.head,
+      status: value.status.filter((line): line is string => typeof line === "string"),
+    },
+  }
+}
+
+function asCount(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.trunc(value)
+    : 0
+}

@@ -1,0 +1,94 @@
+import "server-only"
+
+import { acpAgentKey } from "@/lib/providers/acp"
+import { CLAUDE_CODE_PROVIDER_ID } from "@/lib/providers/claude-code"
+import { CODEX_PROVIDER_ID } from "@/lib/providers/codex"
+import { CURSOR_PROVIDER_ID } from "@/lib/providers/cursor"
+import { PI_PROVIDER_ID } from "@/lib/providers/pi"
+import type { AppSettings } from "@/lib/settings/schema"
+
+/** Providers whose missing CLI can be located with the Windows file picker. */
+export function isHarnessProviderId(providerId: string): boolean {
+  return (
+    providerId === PI_PROVIDER_ID ||
+    providerId === CURSOR_PROVIDER_ID ||
+    providerId === CLAUDE_CODE_PROVIDER_ID ||
+    providerId === CODEX_PROVIDER_ID ||
+    acpAgentKey(providerId) !== null
+  )
+}
+
+export function harnessDisplayName(
+  settings: AppSettings,
+  providerId: string
+): string | null {
+  if (providerId === PI_PROVIDER_ID) return "pi"
+  if (providerId === CURSOR_PROVIDER_ID) return "Cursor Agent"
+  if (providerId === CLAUDE_CODE_PROVIDER_ID) return "Claude Code"
+  if (providerId === CODEX_PROVIDER_ID) return "Codex"
+  const key = acpAgentKey(providerId)
+  const agent = key ? settings.providers.acp.agents[key] : undefined
+  if (!agent) return null
+  return agent.name.trim() || key
+}
+
+/** Writes the picked path onto the field that provider uses to spawn. */
+export function setHarnessBinaryPath(
+  settings: AppSettings,
+  providerId: string,
+  binaryPath: string
+): AppSettings {
+  if (providerId === PI_PROVIDER_ID) {
+    return {
+      ...settings,
+      providers: {
+        ...settings.providers,
+        pi: { ...settings.providers.pi, binPath: binaryPath },
+      },
+    }
+  }
+  if (providerId === CURSOR_PROVIDER_ID) {
+    return {
+      ...settings,
+      providers: {
+        ...settings.providers,
+        cursorAgent: { ...settings.providers.cursorAgent, binPath: binaryPath },
+      },
+    }
+  }
+  if (providerId === CLAUDE_CODE_PROVIDER_ID) {
+    return {
+      ...settings,
+      providers: {
+        ...settings.providers,
+        claudeCode: { ...settings.providers.claudeCode, binPath: binaryPath },
+      },
+    }
+  }
+  if (providerId === CODEX_PROVIDER_ID) {
+    return {
+      ...settings,
+      providers: {
+        ...settings.providers,
+        codex: { ...settings.providers.codex, binPath: binaryPath },
+      },
+    }
+  }
+  const key = acpAgentKey(providerId)
+  const agent = key ? settings.providers.acp.agents[key] : undefined
+  if (!key || !agent) {
+    throw new Error(`${providerId} has no binary path to set`)
+  }
+  return {
+    ...settings,
+    providers: {
+      ...settings.providers,
+      acp: {
+        agents: {
+          ...settings.providers.acp.agents,
+          [key]: { ...agent, command: binaryPath },
+        },
+      },
+    },
+  }
+}

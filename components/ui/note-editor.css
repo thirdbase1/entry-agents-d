@@ -1,0 +1,356 @@
+/*
+ * Crepe, bound to the app's own tokens: every color it draws comes from the
+ * semantic palette, so the note follows the theme and dark mode with no
+ * second stylesheet. Imported by `note-editor.tsx` after Crepe's common CSS.
+ */
+[data-slot="note-editor"] .milkdown {
+  --crepe-color-background: transparent;
+  --crepe-color-on-background: var(--foreground);
+  --crepe-color-surface: var(--card);
+  --crepe-color-surface-low: var(--muted);
+  --crepe-color-on-surface: var(--foreground);
+  --crepe-color-on-surface-variant: var(--muted-foreground);
+  /* Crepe draws toolbar and menu icons in this colour, not just rules. */
+  --crepe-color-outline: var(--muted-foreground);
+  --crepe-color-primary: var(--primary);
+  --crepe-color-secondary: var(--muted);
+  --crepe-color-on-secondary: var(--foreground);
+  --crepe-color-inverse: var(--foreground);
+  --crepe-color-on-inverse: var(--background);
+  --crepe-color-inline-code: var(--foreground);
+  --crepe-color-error: var(--destructive);
+  --crepe-color-hover: var(--accent);
+  --crepe-color-selected: var(--accent);
+  --crepe-color-inline-area: var(--muted);
+  --crepe-font-title: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  --crepe-font-default: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  --crepe-font-code: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+  --crepe-shadow-1: 0 1px 2px 0 color-mix(in oklab, var(--foreground) 10%, transparent);
+  --crepe-shadow-2: 0 4px 12px -2px color-mix(in oklab, var(--foreground) 14%, transparent);
+  background: transparent;
+  color: var(--foreground);
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror {
+  padding: 24px 48px 30vh;
+  font-size: 15px;
+  line-height: 1.7;
+  outline: none;
+}
+
+@media (max-width: 640px) {
+  [data-slot="note-editor"] .milkdown .ProseMirror {
+    padding: 16px 20px 30vh;
+  }
+}
+
+/* Spelling squiggles are noise in notes full of names and code. */
+[data-slot="note-editor"] ::spelling-error,
+[data-slot="note-editor"] ::grammar-error {
+  text-decoration: none;
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror > :first-child {
+  margin-top: 0;
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror h1 {
+  margin-bottom: 0.6em;
+  font-size: 1.9em;
+  line-height: 1.2;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror h2 {
+  margin-top: 1.6em;
+  font-size: 1.35em;
+  line-height: 1.35;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror h3 {
+  font-size: 1.1em;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror :is(h1, h2, h3, h4, h5, h6)::before {
+  display: none;
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror p {
+  line-height: 1.7;
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror :not(pre) > code {
+  background: var(--muted);
+  border-radius: 4px;
+  padding: 0.1em 0.3em;
+  font-size: 0.88em;
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror blockquote {
+  padding-left: 18px;
+  color: var(--muted-foreground);
+}
+
+[data-slot="note-editor"] .milkdown .ProseMirror blockquote::before {
+  width: 2px;
+  background: var(--border);
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-list-item-block li .label-wrapper,
+[data-slot="note-editor"] .milkdown .milkdown-list-item-block li .label-wrapper .label {
+  color: var(--muted-foreground);
+}
+
+/* Tables: rules between rows only, a tinted header. */
+[data-slot="note-editor"] .milkdown .milkdown-table-block {
+  margin-block: 1.25em;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-table-block :is(th, td) {
+  border: 0;
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 70%, transparent);
+  padding: 8px 14px;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-table-block th {
+  background: color-mix(in oklab, var(--muted) 50%, transparent);
+}
+
+/* Blocks move by keyboard and the `/` menu; the drag handle and its plus
+   sat in the margin of every line the pointer crossed. */
+[data-slot="note-editor"] .milkdown .milkdown-block-handle {
+  display: none;
+}
+
+/* Code blocks: a quiet card. One drawn as its preview (Mermaid, LaTeX, a
+   pending placeholder) loses the card and shows its controls on hover. */
+[data-slot="note-editor"] .milkdown .milkdown-code-block {
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--muted) 55%, transparent);
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-code-block .cm-editor,
+[data-slot="note-editor"] .milkdown .milkdown-code-block .cm-gutters {
+  background: transparent;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-code-block:has(> .codemirror-host.hidden) {
+  padding: 4px 0;
+  background: transparent;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-code-block:has(> .codemirror-host.hidden) > .tools {
+  opacity: 0;
+  transition: opacity 150ms ease;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-code-block:has(> .codemirror-host.hidden):is(:hover, :focus-within) > .tools {
+  opacity: 1;
+}
+
+/* The `/` menu, as a popover of this app rather than Crepe's own card. */
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu {
+  width: 240px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 0.5rem);
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: 0 8px 24px color-mix(in oklab, var(--foreground) 12%, transparent);
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu ul {
+  margin: 0;
+  padding: 0;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .tab-group {
+  border-bottom: 1px solid var(--border);
+  padding: 2px 2px 4px;
+  margin-bottom: 2px;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .tab-group ul {
+  gap: 2px;
+  padding: 0;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .tab-group ul li {
+  padding: 3px 8px;
+  border-radius: 4px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .tab-group ul li:hover,
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .tab-group ul li.selected {
+  background: var(--muted);
+  color: var(--foreground);
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .menu-groups {
+  max-height: 280px;
+  padding: 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .menu-groups .menu-group h6 {
+  margin: 0;
+  padding: 8px 8px 2px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  line-height: 16px;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .menu-groups .menu-group li {
+  min-width: 0;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 4px;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .menu-groups .menu-group li.hover,
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .menu-groups .menu-group li.active {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .menu-groups .menu-group li svg {
+  width: 14px;
+  height: 14px;
+  color: currentColor;
+  fill: currentColor;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .menu-groups .menu-group li > span {
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 18px;
+}
+
+[data-slot="note-editor"] .milkdown .milkdown-slash-menu .menu-groups .menu-group + .menu-group::before {
+  margin: 4px 8px;
+  background: var(--border);
+}
+
+/* A thread hung on words: a quiet underline-weight tint, louder when active. */
+[data-slot="note-editor"] .note-editor-anchor {
+  background: color-mix(in oklab, var(--primary) 12%, transparent);
+  border-bottom: 2px solid color-mix(in oklab, var(--primary) 45%, transparent);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background-color 150ms ease;
+}
+
+[data-slot="note-editor"] .note-editor-anchor[data-active="true"] {
+  background: color-mix(in oklab, var(--primary) 24%, transparent);
+  border-bottom-color: var(--primary);
+}
+
+[data-slot="note-editor"] .note-editor-anchor[data-state="running"] {
+  animation: note-editor-pulse 1.6s ease-in-out infinite;
+}
+
+[data-slot="note-editor"] .note-editor-anchor[data-state="error"] {
+  background: color-mix(in oklab, var(--destructive) 12%, transparent);
+  border-bottom-color: color-mix(in oklab, var(--destructive) 55%, transparent);
+}
+
+/* The last selection, kept marked while focus is elsewhere — a composer it
+   was handed to, a menu. */
+[data-slot="note-editor"] .note-editor-held {
+  background: color-mix(in oklab, var(--primary) 18%, transparent);
+  border-radius: 2px;
+}
+
+/* The placeholder an agent plants before it writes. */
+[data-slot="note-editor"] .note-editor-pending {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in oklab, var(--foreground) 6%, transparent) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: note-editor-shimmer 1.8s linear infinite;
+}
+
+[data-slot="note-editor"] .note-editor-pending-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--primary);
+  flex-shrink: 0;
+  animation: note-editor-pulse 1.2s ease-in-out infinite;
+}
+
+[data-slot="note-editor"] .note-editor-mermaid {
+  display: flex;
+  justify-content: center;
+  overflow-x: auto;
+  padding: 8px 0;
+}
+
+[data-slot="note-editor"] .note-editor-mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+[data-slot="note-editor"] .note-editor-mermaid[data-state="error"] {
+  color: var(--destructive);
+  font-size: 12px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  white-space: pre-wrap;
+  justify-content: flex-start;
+}
+
+@keyframes note-editor-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+
+@keyframes note-editor-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-slot="note-editor"] .note-editor-pending,
+  [data-slot="note-editor"] .note-editor-pending-dot,
+  [data-slot="note-editor"] .note-editor-anchor[data-state="running"] {
+    animation: none;
+  }
+}

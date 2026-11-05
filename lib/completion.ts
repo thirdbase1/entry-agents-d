@@ -1,0 +1,297 @@
+import "server-only"
+
+import { parseJsonObject } from "@/lib/json-rescue"
+import { splitModelId } from "@/lib/model-providers/ids"
+import { enabledModelSources } from "@/lib/model-providers/server"
+import {
+  effortRejected,
+  looksReasoningCapableId,
+  rememberEffortRejected,
+} from "@/lib/model-reasoning"
+import { OLLAMA_DEFAULT_NUM_CTX } from "@/lib/ollama-context"
+import {
+  fetchOllamaModelContext,
+  normalizeBaseUrl,
+  probeOllama,
+} from "@/lib/providers/ollama-api"
+import { ensureOllama } from "@/lib/providers/ollama-autostart"
+import type { AppSettings } from "@/lib/settings/schema"
+import { estimateTokens, fitMessagesToContext } from "@/lib/token-estimate"
+
+/**
+ * One short, non-streaming completion against any configured model source —
+ * the local Ollama server or a hosted OpenAI-compatible endpoint — for the
+ * app's own small jobs (a chat title, say). Nothing here streams, resumes or
+ * calls tools; those belong to the providers.
+ */
+
+/**
+ * How long one completion may take, per kind of source. The answer itself is
+ * a few dozen tokens; what the clock actually waits on is everything before
+ * it. A local model that is not loaded yet spends most of a minute reading
+ * its weights off disk before it produces a token (a 20s cap made "Regenerate
+ * title" fail on exactly the first try of the day), and a hosted reasoning
+ * model thinks before it answers even when told to keep that short.
+ */
+const OLLAMA_TIMEOUT_MS = 90_000
+const HOSTED_TIMEOUT_MS = 45_000
+
+/**
+ * A reasoning model spends `max_tokens` on its thinking first, so the budget
+ * a title needs is not the budget it must be given — 200 tokens left a
+ * reasoning model with nothing to answer in.
+ */
+const REASONING_MIN_TOKENS = 2_048
+
+/**
+ * Ollama's default window is 4096 whatever the weights allow — see
+ * `OLLAMA_DEFAULT_NUM_CTX`. A commit message written from a 50k-character
+ * patch is refused with that number by a model that has 128k sitting unused,
+ * which is why this file asks for a bigger `num_ctx` when the native API
+ * can take one. The composer's meter must not show the unused 128k; it reads
+ * the served window from `lib/ollama-context.ts`.
+ */
+
+/** The estimate is an estimate; never fill the window to its last token. */
+const CONTEXT_HEADROOM_TOKENS = 256
+
+/** Windows are asked for in whole steps — a bigger one costs memory to serve. */
+const NUM_CTX_STEP = 1_024
+
+/**
+ * The window to ask for, and the messages that will fit in it.
+ *
+ * Three cases, in order. The prompt fits Ollama's default: ask for nothing and
+ * behave exactly as before. It fits the model but not the default: ask for a
+ * window big enough, rounded up a step. It fits neither: the evidence is
+ * trimmed to the model's ceiling rather than sent to be refused — a commit
+ * message written from half a patch is worth more than a 400.
+ *
+ * A server that will not say what the model can take is taken at its default,
+ * which is the safe direction: `num_ctx` above the architecture's own maximum
+ * is the one way to turn a working request into a failing one.
+ */
+async function fitToOllamaContext(
+  baseUrl: string,
+  model: string,
+  messages: CompletionMessage[],
+  maxTokens: number
+): Promise<{ messages: CompletionMessage[]; numCtx?: number }> {
+  const prompt = messages.reduce(
+    (sum, message) => sum + estimateTokens(message.content),
+    0
+  )
+  const needed = prompt + maxTokens + CONTEXT_HEADROOM_TOKENS
+  if (needed <= OLLAMA_DEFAULT_NUM_CTX) return { messages }
+
+  const ceiling =
+    (await fetchOllamaModelContext(baseUrl, model)) ?? OLLAMA_DEFAULT_NUM_CTX
+  const numCtx = Math.min(
+    ceiling,
+    Math.ceil(needed / NUM_CTX_STEP) * NUM_CTX_STEP
+  )
+  if (needed <= numCtx) return { messages, numCtx }
+  return {
+    messages: fitMessagesToContext(
+      messages,
+      numCtx - maxTokens - CONTEXT_HEADROOM_TOKENS
+    ),
+    numCtx,
+  }
+}
+
+export type CompletionMessage = { role: "system" | "user"; content: string }
+
+/** True when `modelId` names a source this helper can reach with `settings`. */
+export function canComplete(settings: AppSettings, modelId: string): boolean {
+  const { source } = splitModelId(modelId)
+  if (source === "ollama") return settings.providers.ollama.enabled
+  return enabledModelSources(settings).some((entry) => entry.slug === source)
+}
+
+/**
+ * What the endpoint actually said, rather than just the number it said it
+ * with. A pulled-and-since-deleted Ollama model answers 404 with `model
+ * "gemma4:e4b" not found, try pulling it first` — which names the fix, where a
+ * bare "(404)" leaves the user guessing which thing was not found.
+ */
+async function failureText(res: Response, label: string): Promise<string> {
+  const body = await res.text().catch(() => "")
+  let detail = body.trim()
+  try {
+    const parsed = JSON.parse(body) as {
+      error?: string | { message?: string }
+    }
+    const message =
+      typeof parsed.error === "string" ? parsed.error : parsed.error?.message
+    if (message) detail = message
+  } catch {
+    /* not JSON — the raw body is the detail */
+  }
+  detail = detail.replace(/\s+/g, " ").slice(0, 300)
+  return detail ? `${label} (${res.status}): ${detail}` : `${label} (${res.status})`
+}
+
+/** A timeout reads as one; the platform's own message names no model. */
+function timeoutAware(err: unknown, label: string, ms: number): Error {
+  if (err instanceof Error && err.name === "TimeoutError") {
+    return new Error(`${label} did not answer within ${Math.round(ms / 1000)}s`)
+  }
+  return err instanceof Error ? err : new Error(String(err))
+}
+
+export async function complete(
+  settings: AppSettings,
+  modelId: string,
+  messages: CompletionMessage[],
+  options: { maxTokens?: number } = {}
+): Promise<string> {
+  const { source, model } = splitModelId(modelId)
+  const maxTokens = options.maxTokens ?? 200
+
+  if (source === "ollama") {
+    const baseUrl = normalizeBaseUrl(settings.providers.ollama.baseUrl)
+    // The chat may never have touched Ollama this session; start it the way
+    // the providers do rather than failing on a server that is merely down.
+    if (!(await ensureOllama(baseUrl)) && !(await probeOllama(baseUrl))) {
+      throw new Error(`Ollama is not reachable at ${baseUrl}`)
+    }
+    const signal = AbortSignal.timeout(OLLAMA_TIMEOUT_MS)
+    try {
+      const fitted = await fitToOllamaContext(
+        baseUrl,
+        model,
+        messages,
+        maxTokens
+      )
+      const res = await fetch(`${baseUrl}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: fitted.messages,
+          stream: false,
+          think: false,
+          options: {
+            temperature: 0.2,
+            num_predict: maxTokens,
+            ...(fitted.numCtx ? { num_ctx: fitted.numCtx } : null),
+          },
+        }),
+        cache: "no-store",
+        signal,
+      })
+      if (!res.ok) {
+        throw new Error(await failureText(res, "Ollama /api/chat failed"))
+      }
+      const data = (await res.json()) as { message?: { content?: string } }
+      return data.message?.content?.trim() ?? ""
+    } catch (err) {
+      throw timeoutAware(err, `Ollama model ${model}`, OLLAMA_TIMEOUT_MS)
+    }
+  }
+
+  const entry = enabledModelSources(settings).find(
+    (item) => item.slug === source
+  )
+  if (!entry) throw new Error(`No configured model provider named "${source}"`)
+
+  // A reasoning model is asked to think as little as it will, which is most of
+  // the latency, and given room to think in; an endpoint that refuses the
+  // field is retried without it and remembered, as the chat path does.
+  const reasoning = looksReasoningCapableId(model)
+  let effort = reasoning && !effortRejected(modelId)
+  let tokenField: "max_tokens" | "max_completion_tokens" = "max_tokens"
+  const signal = AbortSignal.timeout(HOSTED_TIMEOUT_MS)
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(`${entry.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(entry.apiKey
+            ? {
+                Authorization: `Bearer ${entry.apiKey}`,
+                "x-api-key": entry.apiKey,
+                "anthropic-version": "2023-06-01",
+              }
+            : null),
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          [tokenField]: reasoning
+            ? Math.max(maxTokens, REASONING_MIN_TOKENS)
+            : maxTokens,
+          // Reasoning models refuse `temperature` at all on some endpoints.
+          ...(effort
+            ? { reasoning_effort: "low" }
+            : reasoning
+              ? null
+              : { temperature: 0.2 }),
+          stream: false,
+        }),
+        cache: "no-store",
+        signal,
+      })
+      if (res.status === 400 && attempt < 2) {
+        const detail = await res
+          .clone()
+          .text()
+          .catch(() => "")
+        if (effort && /reasoning_effort|unknown|unsupported/i.test(detail)) {
+          effort = false
+          rememberEffortRejected(modelId)
+          continue
+        }
+        if (
+          tokenField === "max_tokens" &&
+          /max_completion_tokens/.test(detail)
+        ) {
+          tokenField = "max_completion_tokens"
+          continue
+        }
+      }
+      if (!res.ok) {
+        throw new Error(
+          await failureText(res, `${entry.name} chat/completions failed`)
+        )
+      }
+      const data = (await res.json()) as {
+        choices?: Array<{ message?: { content?: string } }>
+      }
+      return data.choices?.[0]?.message?.content?.trim() ?? ""
+    }
+  } catch (err) {
+    throw timeoutAware(err, `${entry.name} model ${model}`, HOSTED_TIMEOUT_MS)
+  }
+}
+
+/** Longest chat title kept; the sidebar row is narrow. */
+export const MAX_TITLE_CHARS = 60
+
+/**
+ * Whatever a model said, as a sidebar row.
+ *
+ * The JSON is unwrapped *before* anything is truncated, which is the order
+ * that matters: a model asked for `{"title": "…"}` that answers with prose
+ * around it would otherwise be clipped mid-object, and the user would end up
+ * with a chat called `{"title": "Fix the streaming rec`. A model that ignored
+ * the JSON request and answered with the title alone takes the same path —
+ * `extractJsonObject` finds no object, and the raw line is cleaned as before.
+ *
+ * Adapted from T3 Code (github.com/pingdotgg/t3code), MIT License,
+ * (c) 2026 T3 Tools Inc.
+ */
+export function sanitizeTitle(raw: string): string {
+  const parsed = parseJsonObject<{ title?: unknown }>(raw)
+  const text = typeof parsed?.title === "string" ? parsed.title : raw
+  const cleaned = (text.split("\n").find((line) => line.trim()) ?? "")
+    .replace(/^title:\s*/i, "")
+    .replace(/^["'“”‘’\s]+|["'“”‘’\s.]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+  return cleaned.length <= MAX_TITLE_CHARS
+    ? cleaned
+    : `${cleaned.slice(0, MAX_TITLE_CHARS - 1).trimEnd()}…`
+}

@@ -1,0 +1,541 @@
+import { NextResponse } from "next/server"
+
+import type { MessageAttachmentData } from "@/components/ui/message"
+import { base64FromDataUrl, sanitizeAttachments } from "@/lib/attachments"
+import { replayHistory } from "@/lib/conversation-replay"
+import type { AgentTokenUsage } from "@/lib/cursor-agent-types"
+import { createToolJournal, userJournalText } from "@/lib/handoff/journal"
+import { commitTurn, prepareTurn } from "@/lib/handoff/server"
+import type {
+  AgentSessionState,
+  NewJournalEvent,
+  TurnStateFrame,
+} from "@/lib/handoff/types"
+import { VIEW_SPEC_PROMPT } from "@/lib/generative-view"
+import { buildMemoryContext } from "@/lib/memory/context"
+import { getProvider } from "@/lib/providers/registry"
+import type {
+  AgentStreamEvent,
+  ChatTurn,
+  PermissionMode,
+} from "@/lib/providers/types"
+import {
+  applyStreamEvent,
+  deriveSessionTitle,
+  newId,
+  seedAssistantMessage,
+} from "@/lib/message-stream"
+import { TurnProcesses } from "@/lib/background-processes"
+import { crossOriginRefusal } from "@/lib/request-origin"
+import { createAskUser } from "@/lib/turn-requests"
+import { bridgeServerFor, requestOrigin } from "@/lib/subagents/bridge"
+import { readSettings } from "@/lib/settings/server"
+import { getSession, readMessages, upsertMessages } from "@/lib/store/sessions"
+import type { SessionPatch, StoredMessage } from "@/lib/store/types"
+
+export const runtime = "nodejs"
+// Vercel's hobby plan caps serverless maxDuration at 60s.
+export const maxDuration = 60
+export const dynamic = "force-dynamic"
+
+type ChatBody = {
+  prompt?: string
+  providerId?: string
+  model?: string
+  /** App session id — the thread in `lib/store`, not the provider's own id. */
+  sessionId?: string
+  effort?: string
+  /**
+   * How much the harness may touch this turn; falls back to the chat's stored
+   * mode, and is dropped entirely unless the provider publishes it.
+   */
+  permissionMode?: string
+  /** Working folder for this run; falls back to the chat's stored folder. */
+  cwd?: string
+  /**
+   * Ids minted by the client so its optimistic messages and the persisted
+   * ones are the same rows. Absent ids are generated here.
+   */
+  userMessageId?: string
+  assistantMessageId?: string
+  attachments?: unknown
+  /**
+   * What the user actually typed, when `prompt` is more than that — the
+   * composer prepends a skill and appends the text of every attached file.
+   * Stored beside the message: it is what search indexes and what the
+   * transcript shows as the user's own words.
+   */
+  typedText?: string
+  /**
+   * Set by the subagent runner (`lib/subagents/runs`), never by the page: the
+   * chat whose agent wrote this prompt. Stored on the user message.
+   */
+  subagentOf?: string
+}
+
+/**
+ * Runs one turn: appends the user message, streams the provider's events
+ * straight through as SSE, and folds the same events into the assistant
+ * message that gets persisted when the run settles. The client renders from
+ * the identical reducer (`lib/message-stream`), so a reload matches the live
+ * stream exactly.
+ */
+export async function POST(req: Request) {
+  const refused = crossOriginRefusal(req)
+  if (refused) return refused
+  let body: ChatBody
+  try {
+    body = (await req.json()) as ChatBody
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 })
+  }
+
+  const prompt = body.prompt?.trim()
+  if (!prompt) {
+    return NextResponse.json({ error: "prompt is required" }, { status: 400 })
+  }
+
+  const sessionId = body.sessionId?.trim()
+  if (!sessionId) {
+    return NextResponse.json({ error: "sessionId is required" }, { status: 400 })
+  }
+  const session = await getSession(sessionId)
+  if (!session) {
+    return NextResponse.json({ error: "Session not found" }, { status: 404 })
+  }
+
+  const providerId = body.providerId?.trim() || session.providerId
+  const model = body.model?.trim() || session.model
+  const settings = await readSettings()
+  const provider = await getProvider(providerId)
+  if (!provider) {
+    return NextResponse.json(
+      { error: `Unknown or disabled provider "${providerId}"` },
+      { status: 400 }
+    )
+  }
+  const info = await provider.info()
+  if (!info.available) {
+    return NextResponse.json(
+      { error: info.unavailableReason ?? `${info.name} is unavailable` },
+      { status: 503 }
+    )
+  }
+
+  const prior = await readMessages(sessionId)
+  const attachments: MessageAttachmentData[] = sanitizeAttachments(
+    body.attachments
+  )
+
+  const typedText = body.typedText?.trim()
+  const userMessage: StoredMessage = {
+    id: body.userMessageId || newId(),
+    content: prompt,
+    sender: "user",
+    createdAt: Date.now(),
+    ...(attachments.length ? { attachments } : null),
+    // Only when it says something `content` does not; an unchanged prompt is
+    // its own typed text and does not need storing twice.
+    ...((typedText && typedText !== prompt) || body.subagentOf
+      ? { metadata: {
+          ...(typedText && typedText !== prompt ? { typedText } : null),
+          ...(body.subagentOf ? { subagentOf: body.subagentOf } : null),
+        } }
+      : null),
+  }
+
+  const shouldTitle =
+    settings.chat.autoTitle &&
+    prior.length === 0 &&
+    (!session.title || session.title === "New chat")
+
+  await upsertMessages(sessionId, [userMessage], {
+    providerId,
+    model,
+    ...(shouldTitle ? { title: deriveSessionTitle(prompt) } : null),
+  })
+
+  const startedAt = Date.now()
+  let assistant = seedAssistantMessage(body.assistantMessageId || newId())
+  let durationMs: number | undefined
+  let usage: AgentTokenUsage | undefined
+  const cwd = body.cwd?.trim() || session.cwd
+
+  // Like `cwd`: the turn's own choice, else what the chat last stored — and
+  // only when this backend actually publishes the mode, so a client that
+  // never sends one (or sends a mode this harness cannot enforce) leaves the
+  // provider on its configured policy exactly as before.
+  //
+  // Resolved before the handoff, not after: a harness that fixes a
+  // conversation's mode when it is created (cursor-agent) needs this turn's
+  // mode to decide whether its stored session can be resumed at all.
+  const permissionMode = allowedPermissionMode(
+    info.capabilities.permissionModes,
+    body.permissionMode?.trim() || session.permissionMode
+  )
+  const sessionMode = info.capabilities.permissionModePerSession
+    ? { perSession: true as const, permissionMode }
+    : undefined
+
+  /**
+   * The backend session this provider owns in this chat, plus whatever the
+   * *other* agents did while it was away.
+   *
+   * A stored id is no longer thrown away when the composer switches provider:
+   * each backend keeps its own conversation, and the one coming back is told
+   * what it missed instead of being handed a transcript it cannot explain.
+   */
+  const prepared = await prepareTurn({
+    session,
+    providerId,
+    cwd,
+    canResume: info.capabilities.resume,
+    mode: sessionMode,
+    enabled: settings.handoff.enabled,
+  })
+  let providerSessionId = prepared.resumeSessionId
+
+  // Providers that resume server-side get the id; stateless ones get the
+  // transcript replayed instead — images included, so a vision model keeps
+  // seeing what was attached earlier in the thread.
+  //
+  // A resumable one with *no* session to resume gets it too: a turn stopped
+  // before the backend minted an id, a repointed folder or a switched
+  // permission mode all leave the next turn on a fresh backend conversation
+  // that has never seen the chat, and "continue" then reads as the first
+  // message ever sent.
+  const history: ChatTurn[] | undefined =
+    info.capabilities.resume &&
+    !info.capabilities.historyOnFreshSession &&
+    prepared.resumeSessionId
+      ? undefined
+      : replayHistory(prior, info.capabilities.vision)
+
+  /**
+   * Standing context for this turn: the generative-view vocabulary, when
+   * `chat.generativeViews` is on and a person is the reader (not a subagent
+   * run), then the user's memory, when that is.
+   *
+   * Backends that resume server-side get it only on the first turn of their
+   * conversation: they already hold everything sent before, so re-sending the
+   * block every turn would stack copies of it in their own transcript. The
+   * stateless ones have their history replayed anyway, so they get it each
+   * time. Either way it never touches `userMessage` — what the user typed is
+   * what gets stored and shown.
+   */
+  const resumed = info.capabilities.resume && !!prepared.resumeSessionId
+  const memoryContext = resumed
+    ? undefined
+    : await buildMemoryContext(settings, {
+        // How this agent can keep memory: through the bridge's `memory_*`
+        // tools when it takes MCP servers (a subagent chat is never given the
+        // bridge), else by editing the files when it has file tools at all.
+        // A note's chat is handed the note tools alone, so memory is shown
+        // to it but not writable there.
+        access:
+          info.capabilities.mcp && !session.parentId && !session.noteId
+            ? "tools"
+            : info.capabilities.tools
+              ? "files"
+              : "none",
+      })
+  // A prompt another agent wrote (`subagentOf`, set by the MCP/CLI runner) is
+  // answered to that agent, not to a person: a ```ui fence is noise in its
+  // context, so the vocabulary is withheld there.
+  // A note's agent writes into the note, where a ```ui fence is noise too.
+  const showViews = settings.chat.generativeViews && !body.subagentOf && !session.noteId
+  const standingContext = resumed
+    ? undefined
+    : [showViews ? VIEW_SPEC_PROMPT : "", memoryContext ?? ""]
+        .filter(Boolean)
+        .join("\n\n") || undefined
+
+  /**
+   * The subagent bridge (`lib/subagents`): lets this chat's agent start other
+   * harnesses as child chats. Only a top-level chat gets it — a subagent that
+   * could start subagents is a fork bomb with a nicer name — and every child
+   * inherits this turn's permission mode.
+   */
+  const mcpServers = session.parentId
+    ? undefined
+    : [
+        await bridgeServerFor({
+          origin: requestOrigin(req),
+          parentId: sessionId,
+          permissionMode: permissionMode ?? info.capabilities.defaultPermissionMode,
+          harness: providerId,
+          model,
+          effort: info.capabilities.effort ? body.effort : undefined,
+          noteId: session.noteId,
+        }),
+      ]
+
+  const abort = new AbortController()
+  const onClientGone = () => abort.abort()
+  req.signal.addEventListener("abort", onClientGone)
+
+  /**
+   * The turn's semantic events, for the next agent to arrive. Text, thinking
+   * and tool output are deliberately absent: the journal is the summary a
+   * returning agent needs, not a second transcript. Tool calls are keyed by
+   * id because every harness reports one twice — the terminal state wins.
+   */
+  const toolJournal = createToolJournal()
+  let sawError = false
+  /**
+   * Whether the backend actually took the prompt. `status` lines are the app
+   * narrating a spawn, and a first event of `error` is the spawn failing — in
+   * neither case has the agent seen the handoff, so the cursor must not move.
+   */
+  let runStarted = false
+
+  /**
+   * What the agent leaves running when this turn ends — a dev server, a
+   * watcher — is kept and listed under the chat (`lib/background-processes`)
+   * instead of dying with the harness.
+   */
+  const processes = new TurnProcesses({
+    sessionId: sessionId!,
+    providerId,
+    cwd,
+    startedAt,
+  })
+
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream({
+    async start(controller) {
+      let closed = false
+      const send = (event: AgentStreamEvent | TurnStateFrame) => {
+        if (closed) return
+        try {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
+          )
+        } catch {
+          closed = true
+        }
+      }
+
+      try {
+        for await (const event of provider.run({
+          prompt,
+          model,
+          standingContext,
+          turnContext: prepared.handoff?.text,
+          sessionId: providerSessionId,
+          mcpServers,
+          effort: info.capabilities.effort ? body.effort : undefined,
+          permissionMode,
+          cwd,
+          history,
+          images: info.capabilities.vision
+            ? attachments.map((a) => base64FromDataUrl(a.url))
+            : undefined,
+          // The channel a blocked backend answers through. It is keyed by this
+          // chat and dies with the turn's abort, so a stopped run can never
+          // leave a form waiting on a promise nobody will resolve.
+          askUser: createAskUser({ sessionId, signal: abort.signal }),
+          processes,
+          signal: abort.signal,
+        })) {
+          if (event.type === "session") providerSessionId = event.sessionId
+          if (event.type === "done") {
+            providerSessionId = event.sessionId ?? providerSessionId
+            durationMs = event.durationMs
+            usage = event.usage
+          }
+          if (event.type === "error") sawError = true
+          if (event.type !== "status" && event.type !== "error") {
+            runStarted = true
+          }
+          if (event.type === "tool") toolJournal.record(event)
+          assistant = applyStreamEvent(assistant, event)
+          send(event)
+        }
+      } catch (err) {
+        if (!abort.signal.aborted) {
+          send({
+            type: "error",
+            message: err instanceof Error ? err.message : `${info.name} failed`,
+          })
+        }
+      } finally {
+        req.signal.removeEventListener("abort", onClientGone)
+        // Counted in the background: the answer does not wait for a process
+        // scan, and `GET /api/processes` waits for this one instead.
+        void processes.settle()
+        const state = await persist()
+        // An app-level frame, not an `AgentStreamEvent`: the marker and the
+        // composer's per-agent hints are this app's own concern, and the
+        // vendored protocol has no business growing a variant for them.
+        // `lib/api-client` routes it away from the stream reducer.
+        if (state) send(state)
+        if (!closed) {
+          try {
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+          } catch {
+            /* client already gone */
+          }
+        }
+        controller.close()
+      }
+    },
+    cancel() {
+      abort.abort()
+    },
+  })
+
+  /**
+   * Saves whatever the turn produced — including a stopped partial answer —
+   * and hands back the app-level frame that tells the client what the turn
+   * was sent and which agents now hold a session in this chat.
+   */
+  async function persist(): Promise<TurnStateFrame | undefined> {
+    const elapsed = (durationMs ?? Date.now() - startedAt) / 1000
+    const outcome = abort.signal.aborted
+      ? "aborted"
+      : sawError
+        ? "error"
+        : "ok"
+    const journalEvents: NewJournalEvent[] = [
+      { kind: "user-message", providerId, text: userJournalText(userMessage.content) },
+      ...toolJournal.events().map(
+        (tool): NewJournalEvent => ({ kind: "tool", providerId, ...tool })
+      ),
+      {
+        kind: "turn-end",
+        providerId,
+        model,
+        outcome,
+        ...(outcome === "error" && assistantError(assistant)
+          ? { error: assistantError(assistant) as string }
+          : null),
+      },
+    ]
+
+    let agentSessions: Record<string, AgentSessionState> | undefined
+    try {
+      agentSessions = await commitTurn({
+        sessionId: sessionId!,
+        providerId,
+        cwd,
+        prepared,
+        events: journalEvents,
+        runStarted,
+        providerSessionId,
+        mode: sessionMode,
+        enabled: settings.handoff.enabled,
+      })
+    } catch {
+      /* the answer is delivered; per-agent bookkeeping is not worth a 500 */
+    }
+
+    const finished: StoredMessage = {
+      ...assistant,
+      createdAt: Date.now(),
+      workedFor: elapsed,
+      metadata: {
+        model,
+        providerId,
+        responseTime: elapsed,
+        finishedAt: Date.now(),
+        ...(cwd ? { cwd, gitBranch: session!.gitBranch } : null),
+        ...tokenMetadata(usage),
+        ...(prepared.handoff ? { handoff: prepared.handoff.marker } : null),
+      },
+    }
+    const keep = finished.content.trim() || (finished.parts?.length ?? 0) > 0
+    const patch: SessionPatch = {
+      providerId,
+      model,
+      // Still written for the provider that ran, so an index read by an older
+      // build (or by anything that only knows the single-id field) resumes
+      // the same conversation `agentSessions` does.
+      ...(providerSessionId ? { providerSessionId } : null),
+      ...(agentSessions ? { agentSessions } : null),
+    }
+    try {
+      // By id, into whatever the file now holds — never the array this turn
+      // read minutes ago. An edit, a deleted turn or another agent's message
+      // that landed while this one streamed has to survive the write.
+      await upsertMessages(
+        sessionId!,
+        keep ? [userMessage, finished] : [userMessage],
+        patch
+      )
+    } catch {
+      /* the turn already streamed; a failed write must not crash the route */
+    }
+
+    return {
+      type: "turn-state",
+      messageId: finished.id,
+      ...(agentSessions ? { agentSessions } : null),
+      ...(prepared.handoff ? { handoff: prepared.handoff.marker } : null),
+    }
+  }
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  })
+}
+
+/** Why a failed turn failed, for the journal — the reducer already wrote it. */
+function assistantError(message: StoredMessage) {
+  const match = /Agent error: (.+)/.exec(message.content)
+  return match?.[1]?.trim() || undefined
+}
+
+/**
+ * The requested permission mode, but only if this provider declared it. An
+ * unknown or unsupported value is dropped rather than refused: the turn still
+ * runs, under the harness's own policy.
+ */
+function allowedPermissionMode(
+  offered: PermissionMode[] | undefined,
+  wanted: string | undefined
+): PermissionMode | undefined {
+  const mode = wanted?.trim()
+  if (!mode) return undefined
+  return (offered ?? []).includes(mode as PermissionMode)
+    ? (mode as PermissionMode)
+    : undefined
+}
+
+/** Only the counters the backend actually reported make it into the record. */
+type CacheAwareUsage = AgentTokenUsage & {
+  cachedInputTokens?: number
+  cacheCreationTokens?: number
+  reasoningTokens?: number
+  contextWindow?: number
+}
+
+function tokenMetadata(usage: AgentTokenUsage | undefined) {
+  if (!usage) return null
+  const {
+    input,
+    output,
+    tokensPerSecond,
+    cachedInputTokens,
+    cacheCreationTokens,
+    reasoningTokens,
+    contextWindow,
+  } = usage as CacheAwareUsage
+  return {
+    ...(input == null ? null : { inputTokens: input }),
+    ...(output == null ? null : { outputTokens: output }),
+    ...(cachedInputTokens == null ? null : { cachedInputTokens }),
+    ...(cacheCreationTokens == null ? null : { cacheCreationTokens }),
+    ...(reasoningTokens == null ? null : { reasoningTokens }),
+    ...(contextWindow == null ? null : { contextWindow }),
+    ...(tokensPerSecond == null ? null : { tokensPerSecond }),
+    ...(input == null && output == null
+      ? null
+      : { tokens: (input ?? 0) + (output ?? 0) }),
+  }
+}

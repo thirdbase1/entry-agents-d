@@ -1,0 +1,786 @@
+import "server-only"
+
+import { execFile, spawn, type ChildProcess } from "child_process"
+import { createHash, type Hash } from "crypto"
+import { join } from "path"
+import { createInterface } from "readline"
+
+import { resolveAgentCommand } from "@/lib/agent-runtime"
+import { CursorTransportFailure } from "@/lib/cursor-transport-failure"
+import type {
+  AgentStreamEvent,
+  AgentTokenUsage,
+} from "@/lib/cursor-agent-types"
+
+export type { AgentStreamEvent }
+
+/**
+ * The CLI's own conversation modes. `agent` is what it runs without a flag —
+ * full tool access; `ask` answers without touching the workspace, and `plan`
+ * writes a plan instead of the change. Only the two non-default ones are ever
+ * passed, so a caller that says nothing gets the CLI's own behaviour.
+ */
+export type CursorAgentMode = "agent" | "ask" | "plan"
+
+export type AgentRunOptions = {
+  prompt: string
+  model: string
+  sessionId?: string
+  workspace?: string
+  mode?: CursorAgentMode
+  signal?: AbortSignal
+}
+
+/**
+ * One line of `--output-format stream-json`. Only the fields something here
+ * reads are named; the CLI sends more (`request_id`, `duration_api_ms`, the
+ * `system`/`user` bookend events) and every one of them is ignored.
+ *
+ * Exported, with the two pure translators below, so the protocol mapping can
+ * be exercised from fixtures rather than by spawning the binary.
+ */
+export type CursorCliEvent = {
+  type?: string
+  subtype?: string
+  session_id?: string
+  call_id?: string
+  timestamp_ms?: number
+  model_call_id?: string
+  duration_ms?: number
+  result?: unknown
+  is_error?: boolean
+  message?: {
+    content?: Array<{ type?: string; text?: string }>
+  }
+  tool_call?: Record<string, unknown>
+  text?: string
+  usage?: Record<string, unknown>
+}
+
+const MAX_FIELD = 50_000
+const STDERR_TAIL_MAX = 64 * 1024
+
+/**
+ * What a tool row is closed with when the turn ends underneath it. A row left
+ * `running` spins forever and, worse, reads in the transcript as a call that
+ * is still going.
+ */
+const UNFINISHED_TOOL_OUTPUT = "Interrupted"
+
+export async function* runCursorAgent(
+  options: AgentRunOptions
+): AsyncGenerator<AgentStreamEvent> {
+  const workspace = options.workspace ?? process.cwd()
+  const { cmd, args: prefix } = resolveAgentCommand()
+  const args = [
+    ...prefix,
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--stream-partial-output",
+    "--trust",
+    "--force",
+    "--approve-mcps",
+    "--workspace",
+    workspace,
+    "--model",
+    options.model,
+  ]
+
+  if (process.platform !== "win32") {
+    args.splice(args.indexOf("--approve-mcps"), 0, "--sandbox", "enabled")
+  }
+
+  // `agent` is the CLI's default and takes no flag.
+  if (options.mode && options.mode !== "agent") {
+    args.push("--mode", options.mode)
+  }
+
+  if (options.sessionId) {
+    args.push("--resume", options.sessionId)
+  }
+
+  args.push("--", options.prompt)
+
+  // The binary is resolved at runtime from PATH / CURSOR_AGENT_BIN, so there is
+  // nothing for the bundler to trace. Without this hint Turbopack gives up on
+  // static analysis and pulls the entire project into the serverless output.
+  const child = spawn(/*turbopackIgnore: true*/ cmd, args, {
+    cwd: workspace,
+    env: process.env,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    // Its own process group, so stopping the turn can take down whatever the
+    // agent's shell tool started rather than only the CLI in front of it.
+    detached: DETACH_CHILDREN,
+  })
+  trackAgent(child)
+
+  // A process that never starts emits `error`, not `exit`, and an unhandled
+  // `error` on a child process is thrown at the whole server rather than at
+  // this turn. Held on an object instead of a `let` so the assignment inside
+  // the listener is still visible to the read below.
+  const failure: { error?: NodeJS.ErrnoException } = {}
+  child.once("error", (err: NodeJS.ErrnoException) => {
+    failure.error = err
+  })
+
+  // Registered now, not after the read loop: both events have already fired by
+  // then for a child that failed to start or was killed, and a listener added
+  // late waits forever for one that will not come again. A signal kill leaves
+  // no exit code, which is a failure and not a clean zero.
+  const exited = new Promise<number>((resolve) => {
+    child.once("close", (code) => resolve(code ?? 1))
+    child.once("error", () => resolve(1))
+  })
+
+  let stderrTail = ""
+  child.stderr?.on("data", (chunk: Buffer | string) => {
+    stderrTail = (stderrTail + String(chunk)).slice(-STDERR_TAIL_MAX)
+  })
+
+  const onAbort = () => killAgent(child)
+  options.signal?.addEventListener("abort", onAbort)
+
+  try {
+    if (!child.stdout) {
+      yield { type: "error", message: "Cursor agent produced no stdout" }
+      return
+    }
+
+    let emittedSession = false
+    let sawStreamingDelta = false
+    let gotText = false
+    let gotResult = false
+    // Everything that has already gone out, so a closing full-text message
+    // repeating the whole turn is dropped instead of printed twice.
+    const emittedHash = createHash("sha256")
+    let emittedLength = 0
+    // Tool calls the CLI started and never closed, so an abnormal end can say
+    // so on the rows themselves.
+    const openTools = new Map<string, string>()
+
+    /**
+     * A reply that is nothing but a transport dump is a failed turn, not an
+     * answer — so its text is withheld while it could still turn out to be
+     * one, and released the moment the reply says anything else. For an
+     * ordinary answer that is its first chunk, so nothing is delayed.
+     */
+    const reply = new CursorTransportFailure()
+    let held: string[] = []
+    function* flushHeld(): Generator<AgentStreamEvent> {
+      const pending = held
+      held = []
+      for (const text of pending) yield { type: "text", text }
+    }
+
+    for await (const line of readLines(child.stdout)) {
+      if (options.signal?.aborted) break
+      const trimmed = line.trim()
+      if (!trimmed.startsWith("{")) continue
+
+      let event: CursorCliEvent
+      try {
+        event = JSON.parse(trimmed) as CursorCliEvent
+      } catch {
+        continue
+      }
+
+      if (event.session_id && !emittedSession) {
+        emittedSession = true
+        yield { type: "session", sessionId: event.session_id }
+      }
+
+      if (event.type === "thinking" && typeof event.text === "string") {
+        yield { type: "thinking", text: event.text }
+        continue
+      }
+
+      if (event.type === "assistant") {
+        const text = assistantText(event, sawStreamingDelta)
+        if (typeof event.timestamp_ms === "number" && !event.model_call_id) {
+          sawStreamingDelta = true
+        }
+        if (text && !repeatsWholeTurn(emittedHash, emittedLength, text)) {
+          gotText = true
+          emittedHash.update(text)
+          emittedLength += text.length
+          reply.push(text)
+          held.push(text)
+          if (!reply.candidate) yield* flushHeld()
+        }
+        continue
+      }
+
+      if (event.type === "tool_call" && event.call_id) {
+        const mapped = mapToolEvent(event)
+        if (mapped.type === "tool") {
+          if (mapped.status === "running") openTools.set(mapped.id, mapped.name)
+          else openTools.delete(mapped.id)
+        }
+        yield mapped
+        continue
+      }
+
+      if (event.type === "result") {
+        gotResult = true
+        // The CLI exits 0 on a transport failure, so the turn only fails here.
+        // A stopped turn is not one of these: the dump is what a cancelled
+        // connection prints on its way out.
+        const transport = options.signal?.aborted ? undefined : reply.failure
+        if (transport) {
+          held = []
+          yield* finishOpenTools(openTools)
+          yield { type: "error", message: transport }
+          return
+        }
+        yield* flushHeld()
+        if (event.is_error) {
+          yield {
+            type: "error",
+            message: stringifyField(event.result) || "Cursor agent failed",
+          }
+        } else if (
+          !gotText &&
+          typeof event.result === "string" &&
+          event.result
+        ) {
+          emittedHash.update(event.result)
+          emittedLength += event.result.length
+          yield { type: "text", text: event.result }
+        }
+        // The CLI closed the turn without closing a row it had opened; say so
+        // on the row before `done`, which is where a consumer stops reading.
+        yield* finishOpenTools(openTools)
+        const usage = readUsage(event)
+        yield {
+          type: "done",
+          sessionId:
+            typeof event.session_id === "string" ? event.session_id : undefined,
+          durationMs:
+            typeof event.duration_ms === "number" ? event.duration_ms : undefined,
+          ...(usage ? { usage } : null),
+        }
+      }
+    }
+
+    const exitCode = await exited
+
+    if (options.signal?.aborted) {
+      yield* finishOpenTools(openTools)
+      return
+    }
+
+    if (failure.error) {
+      yield* finishOpenTools(openTools)
+      yield {
+        type: "error",
+        message: describeSpawnFailure(failure.error, cmd, prefix),
+      }
+      return
+    }
+
+    // The stream ended without a closing `result`, so the decision the result
+    // branch would have made is made here instead.
+    const transport = reply.failure
+    if (transport) {
+      held = []
+      yield* finishOpenTools(openTools)
+      yield { type: "error", message: transport }
+      return
+    }
+    yield* flushHeld()
+
+    if (exitCode !== 0 && !gotResult) {
+      const err =
+        cleanStderr(stderrTail) ||
+        `agent exited with code ${exitCode}`
+      yield* finishOpenTools(openTools)
+      yield { type: "error", message: err.slice(0, MAX_FIELD) }
+      return
+    }
+
+    // A clean exit that still left rows spinning — the stream stopped between
+    // a tool's start and its completion.
+    yield* finishOpenTools(openTools)
+  } finally {
+    options.signal?.removeEventListener("abort", onAbort)
+    killAgent(child)
+  }
+}
+
+/**
+ * The CLI's stdout is torn down when the spawn itself fails, and the iterator
+ * rejects instead of ending. The child's own `error` event carries the real
+ * reason, so swallow the tear-down here and let the caller report that.
+ */
+async function* readLines(stdout: NodeJS.ReadableStream) {
+  const rl = createInterface({ input: stdout })
+  try {
+    yield* rl
+  } catch {
+    /* reported from `failure.error` or the exit code */
+  }
+}
+
+/**
+ * The three ways the CLI fails to launch are indistinguishable in the UI once
+ * the errno is dropped, and each has a different fix — so name the one that
+ * happened and what was tried.
+ */
+function describeSpawnFailure(
+  err: NodeJS.ErrnoException,
+  cmd: string,
+  prefix: string[]
+): string {
+  const target = [cmd, ...prefix].join(" ")
+  if (err.code === "EINVAL" && process.platform === "win32") {
+    return "Could not start the Cursor agent: Node refuses to spawn a .cmd shim directly. Point CURSOR_AGENT_BIN at agent.exe or at the CLI's own entry point."
+  }
+  if (err.code === "ENOENT") {
+    return `Cursor agent not found — tried ${target}. Install the Cursor CLI, set CURSOR_AGENT_BIN to its path, or check that the workspace folder still exists.`
+  }
+  if (err.code === "EACCES") {
+    return `${target} is not executable. Check its permissions or set CURSOR_AGENT_BIN to another path.`
+  }
+  return `Could not start the Cursor agent (${err.code ?? "spawn failed"}): ${err.message} — tried ${target}`
+}
+
+export async function listCursorModels(): Promise<
+  { id: string; name: string }[]
+> {
+  const { cmd, args: prefix } = resolveAgentCommand()
+  // See the note in runCursorAgent(): keep this out of Turbopack's tracing.
+  const child = spawn(/*turbopackIgnore: true*/ cmd, [...prefix, "models"], {
+    cwd: process.cwd(),
+    env: process.env,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    // Same group as the run path, so the timeout below kills by group too and
+    // never has to guess whether this child leads one.
+    detached: DETACH_CHILDREN,
+  })
+  trackAgent(child)
+
+  let stdout = ""
+  let stderr = ""
+  child.stdout?.on("data", (chunk: Buffer | string) => {
+    stdout += String(chunk)
+  })
+  child.stderr?.on("data", (chunk: Buffer | string) => {
+    stderr += String(chunk)
+  })
+
+  const code: number = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      killAgent(child)
+      reject(new Error("Timed out listing Cursor models"))
+    }, 20000)
+    child.once("error", (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+    child.once("close", (exit) => {
+      clearTimeout(timer)
+      resolve(exit ?? 1)
+    })
+  })
+
+  if (code !== 0) {
+    throw new Error(stderr.trim() || `agent models failed (${code})`)
+  }
+
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .map((line) => line.match(/^(\S+)\s+-\s+(.+)$/))
+    .filter((m): m is RegExpMatchArray => Boolean(m))
+    .map((m) => ({ id: m[1], name: m[2] }))
+}
+
+/**
+ * The CLI is not consistent about how it marks the closing full-text message
+ * of a streamed turn, so `assistantText`'s timestamp heuristic can let one
+ * through and the UI prints the answer twice. Shape does not settle it, but
+ * content does: only that closing message restates the entire turn.
+ *
+ * The test is whole-turn equality, never a suffix match — a delta that merely
+ * ends the emitted text (a lone `"\n"`, a closing `")"`) is real output.
+ */
+function repeatsWholeTurn(hash: Hash, length: number, text: string) {
+  if (length === 0 || text.length !== length) return false
+  const candidate = createHash("sha256").update(text).digest("hex")
+  return candidate === hash.copy().digest("hex")
+}
+
+function assistantText(event: CursorCliEvent, sawStreamingDelta: boolean): string {
+  const hasTimestamp = typeof event.timestamp_ms === "number"
+  const hasCallId = Boolean(event.model_call_id)
+  if (hasCallId) return ""
+  if (sawStreamingDelta && !hasTimestamp) return ""
+  return (
+    event.message?.content
+      ?.filter((block) => block.type === "text" && block.text)
+      .map((block) => block.text as string)
+      .join("") ?? ""
+  )
+}
+
+/**
+ * The turn's token counts, off the closing `result` event.
+ *
+ * Cache reads and writes are left out on purpose: `AgentTokenUsage` is input
+ * and output, and folding a 24k cache read into "input" would put a number
+ * under the answer that bears no relation to what the next turn's context has
+ * to fit.
+ */
+export function readUsage(event: CursorCliEvent): AgentTokenUsage | undefined {
+  const raw = event.usage
+  if (!raw) return undefined
+  const input = numberAt(raw, "inputTokens")
+  const output = numberAt(raw, "outputTokens")
+  if (input == null && output == null) return undefined
+  return {
+    ...(input == null ? null : { input }),
+    ...(output == null ? null : { output }),
+  }
+}
+
+function numberAt(record: Record<string, unknown>, key: string) {
+  const value = record[key]
+  return typeof value === "number" ? value : null
+}
+
+/**
+ * One `tool_call` line as the UI's own tool row: the call's human name, the
+ * arguments with the completed diff folded in, its result rendered for the
+ * disclosure, and — where the call was a shell — the exit status it reported.
+ */
+export function mapToolEvent(event: CursorCliEvent): AgentStreamEvent {
+  const parsed = parseToolPayload(event.tool_call)
+  const running = event.subtype === "started"
+  const failed = !running && isToolFailure(parsed.result)
+  const exitCode = running ? undefined : exitCodeFrom(parsed.result)
+  return {
+    type: "tool",
+    id: event.call_id as string,
+    name: parsed.name,
+    status: running ? "running" : failed ? "error" : "done",
+    input: stringifyField(enrichToolArgs(parsed.args, parsed.result)),
+    output: running ? undefined : formatToolResult(parsed.result),
+    ...(exitCode === undefined ? null : { exitCode }),
+  }
+}
+
+/**
+ * The process exit status the shell tool published, and nothing else.
+ *
+ * `shellToolCall` puts it on `result.success.exitCode`. A code is never
+ * inferred from output text and never invented for a call that merely
+ * succeeded — `status` already says that much, and a fabricated `0` would be
+ * worse than no code at all where the reader has to tell "the tests ran and
+ * failed" from "the tool itself broke".
+ */
+function exitCodeFrom(result: unknown): number | undefined {
+  if (!result || typeof result !== "object") return undefined
+  const success = (result as Record<string, unknown>).success
+  if (!success || typeof success !== "object") return undefined
+  const code = (success as Record<string, unknown>).exitCode
+  return typeof code === "number" && Number.isInteger(code) ? code : undefined
+}
+
+/**
+ * Cursor's editToolCall streams `{ path, streamContent }` and only puts the
+ * real unified diff on `result.success.diffString` when the call completes.
+ * Fold that into args so the UI can render a diff without a wider protocol.
+ */
+function enrichToolArgs(args: unknown, result: unknown): unknown {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return args
+  const record = { ...(args as Record<string, unknown>) }
+
+  if (result && typeof result === "object") {
+    const success = (result as Record<string, unknown>).success
+    if (success && typeof success === "object") {
+      const s = success as Record<string, unknown>
+      if (typeof s.diffString === "string" && s.diffString.trim()) {
+        record.diff = s.diffString
+        delete record.streamContent
+      }
+    }
+  }
+
+  return record
+}
+
+function parseToolPayload(toolCall: Record<string, unknown> | undefined): {
+  name: string
+  args?: unknown
+  result?: unknown
+} {
+  if (!toolCall || typeof toolCall !== "object") return { name: "tool" }
+
+  const fn = toolCall.function
+  if (fn && typeof fn === "object") {
+    const record = fn as {
+      name?: string
+      arguments?: unknown
+      result?: unknown
+    }
+    return {
+      name: record.name || "function",
+      args: parseMaybeJson(record.arguments),
+      result: record.result,
+    }
+  }
+
+  // The call is one `<name>ToolCall` key beside the CLI's own bookkeeping
+  // (`toolCallId`, `startedAtMs`, `hookAdditionalContexts`), and JSON key
+  // order is not a contract — so name the key that says what it is, and only
+  // fall back to the first one when nothing matches.
+  const keys = Object.keys(toolCall)
+  const key = keys.find((name) => name.endsWith("ToolCall")) ?? keys[0]
+  if (!key) return { name: "tool" }
+  const payload = toolCall[key] as { args?: unknown; result?: unknown } | undefined
+  return {
+    name: humanizeToolKey(key),
+    args: payload?.args,
+    result: payload?.result,
+  }
+}
+
+function humanizeToolKey(key: string) {
+  const base = key.replace(/ToolCall$/, "")
+  return base
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/^./, (c) => c.toUpperCase())
+}
+
+function parseMaybeJson(value: unknown) {
+  if (typeof value !== "string") return value
+  try {
+    return JSON.parse(value)
+  } catch {
+    return value
+  }
+}
+
+function isToolFailure(result: unknown) {
+  if (!result || typeof result !== "object") return false
+  const record = result as Record<string, unknown>
+  if ("success" in record) return false
+  return "failure" in record || "error" in record
+}
+
+function formatToolResult(result: unknown): string | undefined {
+  if (result == null) return undefined
+  if (typeof result !== "object") return String(result).slice(0, MAX_FIELD)
+  const record = result as Record<string, unknown>
+  const success = record.success
+  if (success && typeof success === "object") {
+    const s = success as Record<string, unknown>
+    // A shell call: what the command printed is the result. The raw payload
+    // repeats the command, its cwd and its timings — all of which the row
+    // already shows — and burying stdout inside that JSON is how "ran the
+    // tests" stops saying which ones failed.
+    if (typeof s.exitCode === "number") {
+      const streams = [s.stdout, s.stderr]
+        .filter((part): part is string => typeof part === "string")
+        // Each stream ends in its own newline; joined as they come, stderr
+        // arrives one blank line below stdout instead of under it.
+        .map((part) => part.replace(/\r?\n+$/, ""))
+        .filter((part) => part !== "")
+        .join("\n")
+      return streams ? streams.slice(0, MAX_FIELD) : `exit ${s.exitCode}`
+    }
+    if (typeof s.totalLines === "number") {
+      const body =
+        typeof s.content === "string"
+          ? s.content.slice(0, MAX_FIELD - 64)
+          : ""
+      return body ? `${s.totalLines} lines\n${body}` : `${s.totalLines} lines`
+    }
+    if (typeof s.linesAdded === "number" || typeof s.linesRemoved === "number") {
+      const added = typeof s.linesAdded === "number" ? s.linesAdded : 0
+      const removed = typeof s.linesRemoved === "number" ? s.linesRemoved : 0
+      const parts: string[] = []
+      if (added > 0) parts.push(`+${added}`)
+      if (removed > 0) parts.push(`−${removed}`)
+      if (parts.length > 0) return parts.join(" ")
+    }
+    if (typeof s.linesCreated === "number") return `+${s.linesCreated}`
+    if (typeof s.path === "string") {
+      const size = typeof s.fileSize === "number" ? ` · ${s.fileSize} B` : ""
+      return `${s.path}${size}`
+    }
+  }
+  return stringifyField(result)
+}
+
+function cleanStderr(raw: string) {
+  return raw
+    .split(/\r?\n/)
+    .filter((line) => !/cursor-retrieval:\s*tracing/i.test(line))
+    .join("\n")
+    .trim()
+}
+
+function stringifyField(value: unknown): string | undefined {
+  if (value == null) return undefined
+  if (typeof value === "string") return value.slice(0, MAX_FIELD)
+  try {
+    return JSON.stringify(capLargeToolFields(value), null, 2).slice(
+      0,
+      MAX_FIELD
+    )
+  } catch {
+    return String(value).slice(0, MAX_FIELD)
+  }
+}
+
+/** Keep JSON parseable when a streamed file body would blow the field budget. */
+function capLargeToolFields(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value
+  const record = { ...(value as Record<string, unknown>) }
+  for (const key of [
+    "streamContent",
+    "fileText",
+    "contents",
+    "content",
+    "file_text",
+    "diff",
+    "diffString",
+    "patch",
+  ]) {
+    const field = record[key]
+    if (typeof field === "string" && field.length > MAX_FIELD - 500) {
+      record[key] = `${field.slice(0, MAX_FIELD - 500)}\n…`
+    }
+  }
+  return record
+}
+
+/**
+ * Every tool row the turn started and never closed, as one terminal event
+ * each. `lib/message-stream` upserts tool parts by id, so these refine the
+ * rows already on screen instead of adding new ones.
+ */
+function* finishOpenTools(
+  open: Map<string, string>
+): Generator<AgentStreamEvent> {
+  for (const [id, name] of open) {
+    yield {
+      type: "tool",
+      id,
+      name,
+      status: "error",
+      output: UNFINISHED_TOOL_OUTPUT,
+    }
+  }
+  open.clear()
+}
+
+/* -------------------------------------------------------------------------- */
+/*                             process teardown                               */
+/* -------------------------------------------------------------------------- */
+
+// Adapted from T3 Code (github.com/pingdotgg/t3code), MIT License, (c) 2026 T3 Tools Inc.
+
+/**
+ * `child.kill()` reaches the CLI and nothing else, so a `npm run dev`, a
+ * `pytest` or a `tail -f` the agent's shell tool started keeps running — and
+ * keeps holding the port — long after the turn was stopped. Spawning
+ * `detached` puts the CLI at the head of its own process group, and signalling
+ * the *negative* pid then reaches everything in it.
+ *
+ * Windows has no process groups to signal; `taskkill /T /F` walks the tree
+ * instead.
+ */
+
+/**
+ * `taskkill` by absolute path, not by a PATH lookup: a folder earlier on PATH
+ * could otherwise supply a `taskkill.exe` of its own to a process that runs
+ * on every turn's end.
+ */
+const TASKKILL = join(
+  process.env.SystemRoot ?? "C:\\Windows",
+  "System32",
+  "taskkill.exe"
+)
+const DETACH_CHILDREN = process.platform !== "win32"
+
+/** How long the group gets to unwind on SIGTERM before SIGKILL. */
+const FORCE_KILL_MS = 1000
+
+/** One escalation per child: a second kill must not restart the clock. */
+const killing = new WeakSet<ChildProcess>()
+
+function killAgent(child: ChildProcess) {
+  if (child.exitCode != null || child.signalCode != null) return
+  if (killing.has(child)) return
+  killing.add(child)
+
+  if (!DETACH_CHILDREN) {
+    // `windowsHide`: from a console-less parent (the desktop sidecar)
+    // taskkill would otherwise open a console window of its own, which
+    // takes the foreground from whatever app the user is in.
+    execFile(
+      /*turbopackIgnore: true*/ TASKKILL,
+      ["/T", "/F", "/PID", String(child.pid)],
+      { windowsHide: true },
+      () => {
+        // Best effort: the tree may already be gone, and there is nothing left
+        // to report it to.
+      }
+    )
+    return
+  }
+
+  signalGroup(child, "SIGTERM")
+  const timer = setTimeout(() => signalGroup(child, "SIGKILL"), FORCE_KILL_MS)
+  timer.unref?.()
+  child.once("close", () => clearTimeout(timer))
+}
+
+function signalGroup(child: ChildProcess, signal: NodeJS.Signals) {
+  const pid = child.pid
+  if (pid === undefined) return
+  if (child.exitCode != null || child.signalCode != null) return
+  try {
+    process.kill(-pid, signal)
+  } catch {
+    // The group is already gone, or this child never got one (a spawn that
+    // failed has no pid to lead one). Fall back to the direct child.
+    try {
+      child.kill(signal)
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/**
+ * A detached child is in its own process group, so the Ctrl-C that reaches
+ * this process does not reach it. Nothing else would then ever kill it, so the
+ * server's own exit sweeps whatever it still has running.
+ */
+const liveAgents = new Set<ChildProcess>()
+let exitHookInstalled = false
+
+function trackAgent(child: ChildProcess) {
+  liveAgents.add(child)
+  child.once("close", () => liveAgents.delete(child))
+  if (exitHookInstalled) return
+  exitHookInstalled = true
+  process.once("exit", () => {
+    // An `exit` handler may only do synchronous work; `process.kill` is.
+    for (const agent of liveAgents) {
+      if (agent.pid === undefined) continue
+      try {
+        process.kill(DETACH_CHILDREN ? -agent.pid : agent.pid, "SIGKILL")
+      } catch {
+        /* already gone */
+      }
+    }
+    liveAgents.clear()
+  })
+}
