@@ -65,8 +65,7 @@ export function ProvidersSection({
       setRefreshing(id ?? "all")
       try {
         await flush()
-        const refreshed = await refresh(id)
-        if (!refreshed) return
+        await refresh(true)
         const models = await fetch("/api/models?provider=entry&refresh=1").then(
           (r) => r.json()
         )
