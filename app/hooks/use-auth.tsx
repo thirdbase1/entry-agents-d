@@ -127,13 +127,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setVerificationUri(data.verification_uri_complete);
       setStatus("awaiting_approval");
 
-      // Open approval page in the system browser
+      // Automatically launch the user's default system browser (Chrome/Edge/Brave)
+      // We call the local sidecar API which spawns the native OS process directly
       const approveUrl = data.verification_uri_complete;
-      if (typeof window !== "undefined") {
-        try {
-          window.open(approveUrl, "_blank");
-        } catch {
-          // ignore
+      try {
+        await fetch("/api/auth/open-browser", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: approveUrl }),
+        });
+      } catch {
+        // Fallback to window.open if local route fails
+        if (typeof window !== "undefined") {
+          try {
+            window.open(approveUrl, "_blank");
+          } catch {
+            // ignore
+          }
         }
       }
 

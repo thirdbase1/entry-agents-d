@@ -2,19 +2,30 @@
  * Entry Agents Desktop - Device Authorization & Session Management
  *
  * Implements the official Entry device authorization flow:
- * 1. POST /api/desktop/device/start -> gets device_code, user_code, verification_uri_complete
+ * 1. POST /api/desktop/device/start -> gets device_code, code, expires_at
  * 2. User approves in browser at https://entry-agents.dev/desktop/approve?code=XXXXXX
  * 3. POST /api/desktop/device/poll -> polls until approved or expired
- * 4. GET /api/desktop/usage / /api/billing/me -> loads real account profile & balance
+ * 4. GET /api/desktop/usage -> loads real account profile & credit balance
  * 5. Securely stores session in OsCredentialStore (Windows DPAPI, macOS Keychain, Linux secret-tool)
  */
 
 import { OsCredentialStore, StoredCredentials } from "./credential-store";
 
-export const DEFAULT_ENTRY_URL =
+export const DEFAULT_ENTRY_WEB_URL =
   process.env.NEXT_PUBLIC_ENTRY_URL ??
   process.env.ENTRY_URL ??
   "https://entry-agents.dev";
+
+export const DEFAULT_ENTRY_BACKEND_URL =
+  process.env.NEXT_PUBLIC_ENTRY_BACKEND_URL ??
+  process.env.ENTRY_BACKEND_URL ??
+  "https://entry-project-b.vercel.app";
+
+export const BACKEND_URLS = [
+  DEFAULT_ENTRY_BACKEND_URL,
+  "https://entry-desktop-backend.vercel.app",
+  DEFAULT_ENTRY_WEB_URL,
+];
 
 export interface DeviceAuthorizeResponse {
   device_code: string;
@@ -45,58 +56,70 @@ export interface DeviceTokenPollResult {
 }
 
 export class EntryDeviceAuthService {
-  readonly baseUrl: string;
+  backendUrl: string;
+  readonly webUrl: string;
   readonly credentialStore: OsCredentialStore;
   private currentAccount: AccountProfile | null = null;
 
-  constructor(baseUrl: string = DEFAULT_ENTRY_URL, credentialStore?: OsCredentialStore) {
-    this.baseUrl = baseUrl.replace(/\/$/, "");
-    this.credentialStore = credentialStore ?? new OsCredentialStore();
+  constructor(
+    backendUrl: string = DEFAULT_ENTRY_BACKEND_URL,
+    webUrlOrStore?: string | OsCredentialStore,
+    maybeStore?: OsCredentialStore
+  ) {
+    let resolvedWebUrl = DEFAULT_ENTRY_WEB_URL;
+    let resolvedStore: OsCredentialStore | undefined;
+
+    if (typeof webUrlOrStore === "string") {
+      resolvedWebUrl = webUrlOrStore;
+      resolvedStore = maybeStore;
+    } else if (webUrlOrStore instanceof OsCredentialStore) {
+      resolvedStore = webUrlOrStore;
+    }
+
+    this.backendUrl = (backendUrl || DEFAULT_ENTRY_BACKEND_URL).replace(/\/$/, "");
+    this.webUrl = (resolvedWebUrl || DEFAULT_ENTRY_WEB_URL).replace(/\/$/, "");
+    this.credentialStore = resolvedStore ?? new OsCredentialStore();
   }
 
   /**
-   * Initiates the device authorization flow by calling the Entry backend.
+   * Initiates the device authorization flow by calling the Entry desktop backend.
    */
   async startDeviceAuthorization(): Promise<DeviceAuthorizeResponse> {
-    const startUrls = [
-      `${this.baseUrl}/api/desktop/device/start`,
-      `${this.baseUrl}/api/desktop/device/code`,
-    ];
-
     let lastError = "Failed to connect to Entry authentication service";
 
-    for (const url of startUrls) {
+    for (const backendUrl of BACKEND_URLS) {
       try {
-        const res = await fetch(url, {
+        const res = await fetch(`${backendUrl}/api/desktop/device/start`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ client_id: "entry-desktop" }),
         });
 
         if (!res.ok) {
-          lastError = `HTTP ${res.status} from ${url}`;
+          lastError = `HTTP ${res.status} from ${backendUrl}/api/desktop/device/start`;
           continue;
         }
 
         const data = await res.json();
-        const code = data.code ?? data.user_code;
-        const deviceCode = data.device_code;
+        const code = data.code ?? data.user_code ?? data.userCode;
+        const deviceCode = data.device_code ?? data.deviceCode;
 
         if (!code || !deviceCode) {
           lastError = "Invalid response from device authorization endpoint";
           continue;
         }
 
-        const webBase = this.baseUrl;
+        // Lock in the active backend URL that successfully issued the code
+        this.backendUrl = backendUrl;
+
+        const webBase = this.webUrl;
         return {
           device_code: deviceCode,
           user_code: code,
           code,
-          verification_uri: data.verification_uri ?? `${webBase}/desktop/approve`,
-          verification_uri_complete:
-            data.verification_uri_complete ??
-            `${webBase}/desktop/approve?code=${encodeURIComponent(code)}`,
-          expires_in: data.expires_in ?? 600,
+          verification_uri: `${webBase}/desktop/approve`,
+          verification_uri_complete: `${webBase}/desktop/approve?code=${encodeURIComponent(code)}`,
+          expires_in: data.expires_in ?? data.expiresIn ?? 600,
           interval: data.interval ?? data.poll_interval_seconds ?? 3,
         };
       } catch (err) {
@@ -111,12 +134,12 @@ export class EntryDeviceAuthService {
    * Polls the device token endpoint until approved, pending, or expired.
    */
   async pollDeviceToken(deviceCode: string): Promise<DeviceTokenPollResult> {
-    const pollUrls = [
-      `${this.baseUrl}/api/desktop/device/poll`,
-      `${this.baseUrl}/api/desktop/device/token`,
+    const pollEndpoints = [
+      `${this.backendUrl}/api/desktop/device/poll`,
+      `${DEFAULT_ENTRY_BACKEND_URL}/api/desktop/device/poll`,
     ];
 
-    for (const url of pollUrls) {
+    for (const url of pollEndpoints) {
       try {
         const res = await fetch(url, {
           method: "POST",
@@ -171,13 +194,13 @@ export class EntryDeviceAuthService {
   }
 
   /**
-   * Fetches account profile and credits using Bearer session token.
+   * Fetches account profile and credits using Bearer session token from /api/desktop/usage.
    */
   async fetchAccountProfile(token: string): Promise<AccountProfile> {
     const profileUrls = [
-      `${this.baseUrl}/api/desktop/usage`,
-      `${this.baseUrl}/api/billing/me`,
-      `${this.baseUrl}/api/auth/me`,
+      `${this.backendUrl}/api/desktop/usage`,
+      `${DEFAULT_ENTRY_BACKEND_URL}/api/desktop/usage`,
+      `${this.webUrl}/api/billing/me`,
     ];
 
     for (const url of profileUrls) {
@@ -229,7 +252,7 @@ export class EntryDeviceAuthService {
       accessToken: token,
       refreshToken: token,
       tokenExpiry: Date.now() + 30 * 24 * 60 * 60 * 1000,
-      baseUrl: this.baseUrl,
+      baseUrl: this.backendUrl,
     });
   }
 

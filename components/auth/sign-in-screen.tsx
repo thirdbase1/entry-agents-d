@@ -15,16 +15,31 @@ export function SignInScreen() {
     cancelSignIn,
   } = useAuth();
 
+  const handleOpenBrowser = React.useCallback((url: string) => {
+    fetch("/api/auth/open-browser", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    }).catch(() => {});
+    if (typeof window !== "undefined") {
+      try {
+        window.open(url, "_blank");
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0b0b0d] text-zinc-100 p-6 select-none">
       <div className="w-full max-w-md rounded-2xl border border-zinc-800 bg-[#141416] p-8 shadow-2xl flex flex-col items-center text-center">
         {/* Entry Logo */}
-        <div className="relative mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-zinc-900 border border-zinc-700/60 shadow-inner">
+        <div className="relative mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-zinc-900 border border-zinc-700/60 shadow-inner overflow-hidden">
           <Image
             src="/icon.png"
             alt="Entry Agents"
-            width={40}
-            height={40}
+            width={48}
+            height={48}
             className="rounded-lg object-contain"
             priority
           />
@@ -59,7 +74,7 @@ export function SignInScreen() {
               {verificationUri && (
                 <button
                   type="button"
-                  onClick={() => window.open(verificationUri, "_blank")}
+                  onClick={() => handleOpenBrowser(verificationUri)}
                   className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 px-4 py-2.5 text-sm font-medium text-white transition-colors"
                 >
                   <ExternalLink className="h-4 w-4" />
