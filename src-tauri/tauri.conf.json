@@ -35,7 +35,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/thirdbase1/entry-agents/releases/latest/download/latest.json"
+        "https://github.com/thirdbase1/entry-agents-d/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"
