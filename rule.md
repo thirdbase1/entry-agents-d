@@ -4,7 +4,7 @@
 
 ---
 
-### 1. Zero Host Host Execution Boundary
+### 1. Zero Host Execution Boundary
 - **NEVER** run unmanaged dev servers, background processes, or `.exe`/`.msi` installers locally on the user's host machine.
 - All testing and validation must be lightweight, sandboxed, or executed via designated CI/CD and build systems.
 
@@ -18,26 +18,25 @@
 ---
 
 ### 3. Production Backend: Main Domain Only (`entry-agents.dev`)
-- **NEVER use Project B** or non-canonical domains (`entry-project-b.vercel.app`, etc.).
+- **NEVER use non-canonical domains.**
 - All desktop integration endpoints reside exclusively under the main domain:
   - Device Auth Start: `POST https://entry-agents.dev/api/desktop/device/start`
   - Device Auth Poll: `POST https://entry-agents.dev/api/desktop/device/poll`
   - Browser Approval: `GET https://entry-agents.dev/desktop/approve?code=XXXXXX`
-  - Gateway Models: `GET https://entry-agents.dev/api/desktop/models` (and `/api/models`)
+  - Gateway Models: `GET https://entry-agents.dev/api/desktop/models`
   - Usage & Credits: `GET https://entry-agents.dev/api/desktop/usage`
   - Per-turn Usage: `POST https://entry-agents.dev/api/desktop/usage`
 - Centralize all backend URLs through `lib/auth/device-auth.ts`. Never hardcode scattered URLs.
 
 ---
 
-### 4. 100% Native "Entry Agents" Identity (No Upstream/Agent-UI Remnants)
-- Everything must look and feel as if built entirely from scratch for Entry Agents.
-- **NO** references to "agent-ui", "agent ui", or upstream legacy project names in:
-  - Git commit messages
-  - `package.json` names or descriptions
-  - Window titles, HTML tags, or UI text
-  - Source code comments or documentation
-- The application identity is strictly **Entry Agents Desktop** (`com.entry.agents`, product name `Entry Agents`).
+### 4. 100% Native Identity
+- The application is built from scratch as **Entry Agents Desktop**.
+- Product identity is strictly:
+  - Application Name: **Entry Agents Desktop**
+  - Bundle Identifier: **`com.entry.agents`**
+  - Binary Name: **`Entry Agents`**
+  - Repository: **`thirdbase1/entry-agents-d`**
 
 ---
 
@@ -54,9 +53,19 @@
 
 ---
 
-### 7. Gateway Model Representation & Accurate Provider Icons
-- **Entry is the Gateway Provider, NOT a model.**
-- Entry Gateway provides access to world-class models from multiple leading AI labs:
+### 7. User Authentication & Model Endpoint Calling
+- **NEVER require Gateway API keys or Gateway URLs from the desktop user.**
+- The desktop user authenticates exclusively through the Entry device authorization flow.
+- The resulting user session token (stored securely in OS Credential Store) is passed as:
+  `Authorization: Bearer <session_token>`
+  to `https://entry-agents.dev/api/desktop/models` and `https://entry-agents.dev/api/desktop/usage`.
+- The Entry Web backend resolves the user and queries its internal model gateway on the server.
+
+---
+
+### 8. Gateway Model Representation & Accurate Provider Icons
+- **Entry is the Platform Gateway Provider, NOT a single model.**
+- Entry Gateway delivers models from world-class AI providers:
   - **Anthropic**: Claude 3.7 Sonnet, Claude 3.5 Sonnet, Claude 3.5 Haiku, Claude Opus
   - **OpenAI**: GPT-4o, GPT-4o mini, o1, o3, o3-mini
   - **Google**: Gemini 2.0 Flash, Gemini 1.5 Pro, Gemini 1.5 Flash
@@ -70,7 +79,7 @@
 
 ---
 
-### 8. OpenCode Architectural Principles
+### 9. OpenCode Architectural Principles
 Study and apply OpenCode's proven autonomous desktop patterns:
 - **Permission Modes**:
   - `read-only`: Inspect files and analyze code without disk modifications.

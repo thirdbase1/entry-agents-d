@@ -367,25 +367,17 @@ export function createEntryProvider(
   void appSettings;
   const conf: EntrySettings = settings ?? {
     enabled: true,
-    baseUrl: process.env.GATEWAY_BASE_URL || DEFAULT_GATEWAY_URL,
-    apiKey: process.env.GATEWAY_API_KEY || "",
+    baseUrl: DEFAULT_ENTRY_URL,
+    apiKey: "",
     permissionMode: "edits",
   }
 
-  const baseUrl = (
-    process.env.GATEWAY_BASE_URL ||
-    conf.baseUrl ||
-    DEFAULT_GATEWAY_URL
-  ).replace(/\/+$/, "")
+  const baseUrl = (conf.baseUrl || DEFAULT_ENTRY_URL).replace(/\/+$/, "")
 
-  // Active session token retrieved directly from OS Credential Store (Windows DPAPI, macOS Keychain)
-  const authSession = getDeviceAuthService().getActiveSession()
-  const apiKey =
-    authSession?.accessToken ||
-    process.env.ENTRY_SESSION_TOKEN ||
-    process.env.GATEWAY_API_KEY ||
-    conf.apiKey ||
-    ""
+  const getSessionToken = () => {
+    const authSession = getDeviceAuthService().getActiveSession()
+    return authSession?.accessToken || process.env.ENTRY_SESSION_TOKEN || ""
+  }
 
   return {
     async info(): Promise<ProviderInfo> {
@@ -408,7 +400,7 @@ export function createEntryProvider(
 
     /**
      * Dynamically retrieves all available models and their context windows
-     * from the Gateway. Zero hardcoded models.
+     * from the Entry platform using the user's authenticated session token.
      */
     async listModels(): Promise<ModelOption[]> {
       const now = Date.now()
@@ -416,21 +408,21 @@ export function createEntryProvider(
         return gatewayModelsCache
       }
 
+      const sessionToken = getSessionToken()
       const endpoints = [
-        "https://entry-agents.dev/api/models",
-        "https://entry-gateway-six.vercel.app/v1/models",
+        `${baseUrl}/api/desktop/models`,
         `${baseUrl}/api/models`,
-        `${baseUrl}/models`,
       ]
 
       for (const ep of endpoints) {
         try {
           const controller = new AbortController()
-          const timer = setTimeout(() => controller.abort(), 4000)
-          const headers: Record<string, string> = {}
-          if (apiKey) {
-            headers["Authorization"] = `Bearer ${apiKey}`
-            headers["Cookie"] = `better-auth.session_token=${apiKey}`
+          const timer = setTimeout(() => controller.abort(), 5000)
+          const headers: Record<string, string> = {
+            Accept: "application/json",
+          }
+          if (sessionToken) {
+            headers["Authorization"] = `Bearer ${sessionToken}`
           }
           const res = await fetch(ep, {
             headers,
@@ -439,26 +431,25 @@ export function createEntryProvider(
 
           if (res.ok) {
             const json = (await res.json()) as {
+              models?: Array<{
+                id: string
+                name?: string
+                context_window?: number
+                contextWindow?: number
+                owned_by?: string
+              }>
               data?: Array<{
                 id: string
                 name?: string
                 context_window?: number
                 owned_by?: string
-                protocols?: string[]
-              }>
-              models?: Array<{
-                id: string
-                name?: string
-                context_window?: number
-                contextLength?: number
-                owned_by?: string
               }>
             }
 
-            const rawModels = json.data || json.models
+            const rawModels = json.models || json.data
             if (Array.isArray(rawModels) && rawModels.length > 0) {
               const mapped: ModelOption[] = rawModels.map((m) => {
-                const ctx = m.context_window || (m as { contextLength?: number }).contextLength || 1_000_000
+                const ctx = m.context_window || (m as { contextWindow?: number }).contextWindow || 1_000_000
                 const ctxLabel = ctx >= 1_000_000 ? `${(ctx / 1_000_000).toFixed(0)}M` : `${Math.round(ctx / 1000)}k`
                 const provider = m.owned_by || getProviderFromModelId(m.id)
                 return {
@@ -483,7 +474,66 @@ export function createEntryProvider(
         return gatewayModelsCache
       }
 
-      return []
+      // Default curated models from Entry Gateway with accurate provider groups
+      const fallbackModels: ModelOption[] = [
+        {
+          id: "claude-3-7-sonnet-20250219",
+          name: "Claude 3.7 Sonnet (200k ctx)",
+          description: "Anthropic Claude 3.7 Sonnet · Hybrid reasoning coding model",
+          contextLength: 200_000,
+          group: "anthropic",
+        },
+        {
+          id: "claude-3-5-sonnet-20241022",
+          name: "Claude 3.5 Sonnet (200k ctx)",
+          description: "Anthropic Claude 3.5 Sonnet · Industry standard for software engineering",
+          contextLength: 200_000,
+          group: "anthropic",
+        },
+        {
+          id: "gpt-4o",
+          name: "GPT-4o (128k ctx)",
+          description: "OpenAI flagship multimodal coding model",
+          contextLength: 128_000,
+          group: "openai",
+        },
+        {
+          id: "o3-mini",
+          name: "o3-mini (200k ctx)",
+          description: "OpenAI high-speed reasoning model specialized in STEM and coding",
+          contextLength: 200_000,
+          group: "openai",
+        },
+        {
+          id: "gemini-2.0-flash",
+          name: "Gemini 2.0 Flash (1M ctx)",
+          description: "Google next-generation low-latency 1M context model",
+          contextLength: 1_000_000,
+          group: "google",
+        },
+        {
+          id: "deepseek-chat",
+          name: "DeepSeek V3 (128k ctx)",
+          description: "DeepSeek 671B MoE model",
+          contextLength: 128_000,
+          group: "deepseek",
+        },
+        {
+          id: "deepseek-reasoner",
+          name: "DeepSeek R1 (128k ctx)",
+          description: "DeepSeek open-weights reasoning model",
+          contextLength: 128_000,
+          group: "deepseek",
+        },
+        {
+          id: "meta-llama/llama-3.3-70b-instruct",
+          name: "Llama 3.3 70B (128k ctx)",
+          description: "Meta open-weights flagship LLM",
+          contextLength: 128_000,
+          group: "meta",
+        },
+      ]
+      return fallbackModels
     },
 
     async effortModels(): Promise<string[]> {
@@ -576,10 +626,11 @@ export function createEntryProvider(
       }
       const modelId = options.model || models[0].id
 
+      const sessionToken = getSessionToken()
       const urlCandidates = [
-        `${baseUrl}/chat/completions`,
-        "https://entry-gateway-six.vercel.app/v1/chat/completions",
-        "https://entry-agents.dev/v1/chat/completions",
+        `${baseUrl}/api/desktop/chat`,
+        `${baseUrl}/api/chat`,
+        `${baseUrl}/v1/chat/completions`,
       ]
 
       let targetUrl = urlCandidates[0]
@@ -611,9 +662,9 @@ export function createEntryProvider(
             const reqHeaders: Record<string, string> = {
               "Content-Type": "application/json",
             }
-            if (apiKey) {
-              reqHeaders["Authorization"] = `Bearer ${apiKey}`
-              reqHeaders["Cookie"] = `better-auth.session_token=${apiKey}`
+            if (sessionToken) {
+              reqHeaders["Authorization"] = `Bearer ${sessionToken}`
+              reqHeaders["Cookie"] = `better-auth.session_token=${sessionToken}`
             }
 
             const attempt = await fetch(candidate, {
