@@ -95,6 +95,7 @@ export function getProviderFromModelId(modelId: string): string {
 let gatewayModelsCache: ModelOption[] | null = null
 let lastGatewayFetchMs = 0
 const CACHE_TTL_MS = 60_000
+const modelCapabilitiesCache = new Map<string, string[]>()
 
 export const ENTRY_TOOLS = [
   {
@@ -436,12 +437,17 @@ export function createEntryProvider(
                 name?: string
                 context_window?: number
                 contextWindow?: number
+                max_output_tokens?: number
+                maxOutputTokens?: number
+                capabilities?: string[]
                 owned_by?: string
+                provider?: string
               }>
               data?: Array<{
                 id: string
                 name?: string
                 context_window?: number
+                capabilities?: string[]
                 owned_by?: string
               }>
             }
@@ -449,9 +455,19 @@ export function createEntryProvider(
             const rawModels = json.models || json.data
             if (Array.isArray(rawModels) && rawModels.length > 0) {
               const mapped: ModelOption[] = rawModels.map((m) => {
-                const ctx = m.context_window || (m as { contextWindow?: number }).contextWindow || 1_000_000
-                const ctxLabel = ctx >= 1_000_000 ? `${(ctx / 1_000_000).toFixed(0)}M` : `${Math.round(ctx / 1000)}k`
-                const provider = m.owned_by || getProviderFromModelId(m.id)
+                const ctx =
+                  m.context_window ||
+                  (m as { contextWindow?: number }).contextWindow ||
+                  1_000_000
+                const ctxLabel =
+                  ctx >= 1_000_000
+                    ? `${(ctx / 1_000_000).toFixed(0)}M`
+                    : `${Math.round(ctx / 1000)}k`
+                const provider =
+                  m.owned_by || m.provider || getProviderFromModelId(m.id)
+                if (m.capabilities) {
+                  modelCapabilitiesCache.set(m.id, m.capabilities)
+                }
                 return {
                   id: m.id,
                   name: m.name ? `${m.name} (${ctxLabel} ctx)` : `${m.id} (${ctxLabel} ctx)`,
@@ -474,76 +490,31 @@ export function createEntryProvider(
         return gatewayModelsCache
       }
 
-      // Default curated models from Entry Gateway with accurate provider groups
-      const fallbackModels: ModelOption[] = [
-        {
-          id: "claude-3-7-sonnet-20250219",
-          name: "Claude 3.7 Sonnet (200k ctx)",
-          description: "Anthropic Claude 3.7 Sonnet · Hybrid reasoning coding model",
-          contextLength: 200_000,
-          group: "anthropic",
-        },
-        {
-          id: "claude-3-5-sonnet-20241022",
-          name: "Claude 3.5 Sonnet (200k ctx)",
-          description: "Anthropic Claude 3.5 Sonnet · Industry standard for software engineering",
-          contextLength: 200_000,
-          group: "anthropic",
-        },
-        {
-          id: "gpt-4o",
-          name: "GPT-4o (128k ctx)",
-          description: "OpenAI flagship multimodal coding model",
-          contextLength: 128_000,
-          group: "openai",
-        },
-        {
-          id: "o3-mini",
-          name: "o3-mini (200k ctx)",
-          description: "OpenAI high-speed reasoning model specialized in STEM and coding",
-          contextLength: 200_000,
-          group: "openai",
-        },
-        {
-          id: "gemini-2.0-flash",
-          name: "Gemini 2.0 Flash (1M ctx)",
-          description: "Google next-generation low-latency 1M context model",
-          contextLength: 1_000_000,
-          group: "google",
-        },
-        {
-          id: "deepseek-chat",
-          name: "DeepSeek V3 (128k ctx)",
-          description: "DeepSeek 671B MoE model",
-          contextLength: 128_000,
-          group: "deepseek",
-        },
-        {
-          id: "deepseek-reasoner",
-          name: "DeepSeek R1 (128k ctx)",
-          description: "DeepSeek open-weights reasoning model",
-          contextLength: 128_000,
-          group: "deepseek",
-        },
-        {
-          id: "meta-llama/llama-3.3-70b-instruct",
-          name: "Llama 3.3 70B (128k ctx)",
-          description: "Meta open-weights flagship LLM",
-          contextLength: 128_000,
-          group: "meta",
-        },
-      ]
-      return fallbackModels
+      return []
     },
 
     async effortModels(): Promise<string[]> {
       const models = await this.listModels()
-      return models.map((m) => m.id)
+      return models
+        .filter((m) => {
+          const caps = modelCapabilitiesCache.get(m.id) || []
+          if (caps.includes("reasoning")) return true
+          const lower = m.id.toLowerCase()
+          return /(?:o1|o3|r1|reasoner|thinking|reasoning|opus|sonnet|gemini-3|gpt-5)/i.test(lower)
+        })
+        .map((m) => m.id)
     },
 
     async visionModels(): Promise<string[]> {
       const models = await this.listModels()
-      return models.map((m) => m.id)
+      return models
+        .filter((m) => {
+          const caps = modelCapabilitiesCache.get(m.id) || []
+          if (caps.includes("vision")) return true
+          const lower = m.id.toLowerCase()
+          return /(?:vision|vl|flash|omni|gpt-4|claude|gemini)/i.test(lower)
+        })
+        .map((m) => m.id)
     },
 
     async listModelGroups(): Promise<ModelPickerGroup[]> {

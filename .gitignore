@@ -48,4 +48,8 @@ next-env.d.ts
 
 # local pnpm store / scratch dirs from test runs
 /.pnpm-store/
+
+# Local agent rules (never commit to git)
+rule.md
+
 /.tmp-*/
