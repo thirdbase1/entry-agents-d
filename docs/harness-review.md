@@ -1,6 +1,6 @@
 # Harness review — 2026-09-06
 
-Scope: economical review of Agent UI, with two Luna subtasks and short live
+Scope: economical review of Entry Agents Desktop, with two Luna subtasks and short live
 DeepSeek Flash calls using the existing provider configuration. No credentials
 are included in this report.
 
@@ -37,7 +37,7 @@ are included in this report.
 
 These are review findings, not claims of complete CLI parity:
 
-| Capability | Pi in Agent UI | DeepSeek Harness in Agent UI |
+| Capability | Pi in Entry Agents | DeepSeek Harness in Entry Agents |
 | --- | --- | --- |
 | Tool output | Read verified; write/edit/bash exposed | ACP read verified; tool events exposed |
 | Resume | Session IDs supported | ACP session resume supported |

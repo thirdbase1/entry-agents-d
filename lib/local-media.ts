@@ -7,7 +7,7 @@
  * will fetch, whatever the markdown says. So the path is rewritten to a URL on
  * the app's own origin, `GET /api/files`, which reads the file and serves it
  * back. Percent-encoding it also fixes the other half of the problem — a path
- * with a space in it (`Agent UI`) is not a markdown link target at all.
+ * with a space in it (`Entry Agents`) is not a markdown link target at all.
  *
  * Only image targets are rewritten. A plain link to a file stays a link: it
  * would navigate away from the chat, and nothing about that is an improvement.

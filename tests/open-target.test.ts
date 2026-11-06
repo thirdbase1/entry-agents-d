@@ -23,8 +23,8 @@ import {
 
 test("every element of a cmd.exe line is quoted", () => {
   assert.equal(
-    cmdCommandLine(["C:\\bin\\code.cmd", "C:\\Users\\me\\Agent UI\\app.ts"]),
-    '"C:\\bin\\code.cmd" "C:\\Users\\me\\Agent UI\\app.ts"'
+    cmdCommandLine(["C:\\bin\\code.cmd", "C:\\Users\\me\\Entry Agents\\app.ts"]),
+    '"C:\\bin\\code.cmd" "C:\\Users\\me\\Entry Agents\\app.ts"'
   )
 })
 

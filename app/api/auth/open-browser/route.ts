@@ -3,6 +3,9 @@ import { spawn } from "child_process";
 
 export const runtime = "nodejs";
 
+let lastUrl = "";
+let lastLaunchTime = 0;
+
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -17,8 +20,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Only http/https URLs allowed" }, { status: 400 });
     }
 
+    // Deduplicate rapid requests for the same URL (e.g. React StrictMode / multi-trigger)
+    const now = Date.now();
+    if (url === lastUrl && now - lastLaunchTime < 3000) {
+      return NextResponse.json({ success: true, opened: true, deduplicated: true });
+    }
+    lastUrl = url;
+    lastLaunchTime = now;
+
     if (process.platform === "win32") {
-      // In Windows, launching via cmd.exe /c start "" "<url>" triggers the system default browser (Chrome, Edge, etc.)
+      // In Windows, cmd.exe /c start "" "<url>" triggers the system default browser exactly once
       const child = spawn("cmd.exe", ["/c", "start", "", url], {
         detached: true,
         stdio: "ignore",

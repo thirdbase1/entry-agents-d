@@ -23,8 +23,8 @@ import type { MessagePart } from "@/components/ui/message"
 
 test("a local image target becomes a route URL, spaces and all", () => {
   assert.equal(
-    linkLocalImages("![chart](C:\\Users\\me\\Agent UI\\wykres.png)"),
-    "![chart](/api/files?path=C%3A%5CUsers%5Cme%5CAgent%20UI%5Cwykres.png)"
+    linkLocalImages("![chart](C:\\Users\\me\\Entry Agents\\wykres.png)"),
+    "![chart](/api/files?path=C%3A%5CUsers%5Cme%5CEntry%20Agents%5Cwykres.png)"
   )
   assert.equal(
     linkLocalImages("![](/home/me/out/plot.png)"),
@@ -116,7 +116,7 @@ test("resolveLocalPath joins the same way but keeps a bare name when it cannot",
 })
 
 test("the route URL round-trips back to the path it serves", () => {
-  const path = "C:\\Users\\me\\Agent UI\\wykres.png"
+  const path = "C:\\Users\\me\\Entry Agents\\wykres.png"
   assert.equal(localPathFromUrl(localFileUrl(path)), path)
   assert.equal(localPathFromUrl("/not/a/route/url"), "/not/a/route/url")
   assert.deepEqual(localFilesInMarkdown(linkLocalImages(`![c](${path})`)), [path])

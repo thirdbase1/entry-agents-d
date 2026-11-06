@@ -32,7 +32,7 @@ export function useAttention({
 
   React.useEffect(() => {
     document.title = `${badgePrefix(waitingCount)}${
-      activeTitle ? `${activeTitle} — Agent UI` : "Agent UI"
+      activeTitle ? `${activeTitle} — Entry Agents` : "Entry Agents"
     }`
   }, [activeTitle, waitingCount])
 }

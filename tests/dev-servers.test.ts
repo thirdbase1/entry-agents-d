@@ -143,7 +143,7 @@ test("an excluded port is never published", async () => {
   clearDevServerCache()
   const port = await listen((_req, res) => {
     res.writeHead(200, { "content-type": "text/html" })
-    res.end("<title>Agent UI</title>")
+    res.end("<title>Entry Agents</title>")
   })
   const found = await discoverDevServers({ exclude: [port] })
   assert.equal(

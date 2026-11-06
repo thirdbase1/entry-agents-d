@@ -236,14 +236,14 @@ function AcpAgentRow({
           </SetupLink>
         ) : isDsh ? (
           <p className="text-[12px] text-muted-foreground">
-            Install DeepSeek Harness on the machine running Agent UI. Set its
+            Install DeepSeek Harness on the machine running Entry Agents Desktop. Set its
             command below, then configure a DeepSeek key or a compatible
             endpoint.
           </p>
         ) : (
           <p className="text-[12px] text-muted-foreground">
             Use a command that serves ACP over stdio. Install and authenticate
-            it on the machine running Agent UI.
+            it on the machine running Entry Agents Desktop.
           </p>
         )}
 

@@ -1,4 +1,4 @@
-//! Agent UI desktop shell.
+//! Entry Agents desktop shell.
 //!
 //! The web app is not embedded as static files: it is the real Next.js
 //! standalone server, shipped inside the bundle together with a Node runtime
@@ -248,7 +248,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("failed to start the Agent UI shell");
+        .expect("failed to start the Entry Agents shell");
 
     app.run(|handle, event| match event {
         // macOS delivers ⌘Q and the application menu's Quit here rather than as
@@ -524,7 +524,7 @@ fn show_failure(window: &WebviewWindow, port: Option<u16>, detail: &str) {
         None => format!("The bundled server could not be started.\n\n{detail}"),
     };
     if let Ok(json) = serde_json::to_string(&message) {
-        let _ = window.eval(format!("window.__agentUiError({json})"));
+        let _ = window.eval(format!("(window.__entryAgentsError || window.__agentUiError)({json})"));
     }
     let _ = window.show();
     let _ = window.set_focus();

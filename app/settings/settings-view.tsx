@@ -462,7 +462,7 @@ export function SettingsView({
             ) : null}
 
             <p className="mt-6 px-0.5 pb-4 text-[11px] text-muted-foreground">
-              Agent UI runs entirely on this machine.
+              Entry Agents runs entirely on this machine.
             </p>
           </div>
         </main>

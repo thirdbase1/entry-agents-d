@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Agent UI</title>
+    <title>Entry Agents</title>
     <style>
       :root {
         color-scheme: dark;
@@ -100,14 +100,14 @@
         <div class="spinner"></div>
       </div>
       <div id="error">
-        <h1>Agent UI could not start</h1>
-        <p class="muted">The local server did not come up. Details:</p>
+        <h1>Entry Agents could not start</h1>
+        <p class="muted">The local runtime did not respond. Details:</p>
         <pre id="error-detail"></pre>
       </div>
     </div>
     <script>
       // Called from Rust (`webview.eval`) when the sidecar fails to become ready.
-      window.__agentUiError = function (message) {
+      window.__entryAgentsError = window.__agentUiError = function (message) {
         document.getElementById("error-detail").textContent = String(message);
         document.body.classList.add("failed");
       };

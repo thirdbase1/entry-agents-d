@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { openExternal } from "@/lib/desktop";
 import type { AccountProfile, DeviceAuthorizeResponse } from "@/lib/auth/device-auth";
 
 export type AuthStatus =
@@ -127,25 +128,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setVerificationUri(data.verification_uri_complete);
       setStatus("awaiting_approval");
 
-      // Automatically launch the user's default system browser (Chrome/Edge/Brave)
-      // We call the local sidecar API which spawns the native OS process directly
+      // Automatically launch the user's default system browser (Chrome/Edge/Brave) once
       const approveUrl = data.verification_uri_complete;
-      try {
-        await fetch("/api/auth/open-browser", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: approveUrl }),
-        });
-      } catch {
-        // Fallback to window.open if local route fails
-        if (typeof window !== "undefined") {
-          try {
-            window.open(approveUrl, "_blank");
-          } catch {
-            // ignore
-          }
-        }
-      }
+      void openExternal(approveUrl);
 
       // Begin polling every interval seconds (default 3s)
       const intervalSec = Math.max(2, data.interval || 3);

@@ -5,9 +5,9 @@
 T3 Code's `docs/internals/performance-regressions.md` describes bounded initial
 thread snapshots and older-history pages, a separate subscription for live
 command output, and tests for transport budgets. Its `MessagesTimeline.tsx`
-uses a virtual list. Agent UI loads the entire JSON transcript and its vendored
+uses a virtual list. Entry Agents loads the entire JSON transcript and its vendored
 `MessageList` mounts every row, though offscreen rows use `content-visibility`.
-Agent UI already coalesces stream events per animation frame, defers several
+Entry Agents already coalesces stream events per animation frame, defers several
 derived transcript scans, memoizes rows, and debounces draft persistence.
 
 The startup waterfall was distinct: all provider probes had to finish before

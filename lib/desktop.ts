@@ -338,21 +338,47 @@ export async function requestAttention(): Promise<void> {
 }
 
 /**
- * Opens a URL in the system browser. The shell plugin's `open` does it from
- * the desktop app, where a `target="_blank"` anchor has no window to open
- * into; a browser tab just opens a tab.
+ * Opens a URL in the system browser with zero second-window jank.
+ * Uses Tauri's shell plugin first; falls back to the backend's native OS launcher.
+ * Never calls window.open in the desktop shell to prevent WebView2 popups.
  */
+let lastExternalLaunchTime = 0
+let lastExternalLaunchUrl = ""
+
 export async function openExternal(url: string): Promise<void> {
+  const now = Date.now()
+  if (url === lastExternalLaunchUrl && now - lastExternalLaunchTime < 2500) {
+    return
+  }
+  lastExternalLaunchUrl = url
+  lastExternalLaunchTime = now
+
   const shell = tauri()?.shell
   if (shell && typeof shell.open === "function") {
     try {
       await shell.open(url)
       return
     } catch {
-      /* fall through */
+      /* fall through to backend route */
     }
   }
-  if (typeof window !== "undefined") window.open(url, "_blank", "noopener")
+
+  // Call the desktop backend launcher which invokes OS native browser
+  try {
+    const res = await fetch("/api/auth/open-browser", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    })
+    if (res.ok) return
+  } catch {
+    /* fallback only in plain browser tabs */
+  }
+
+  // Only run window.open in plain browser tabs, never in desktop shell
+  if (!isDesktop() && typeof window !== "undefined") {
+    window.open(url, "_blank", "noopener")
+  }
 }
 
 /* -------------------------------------------------------------------------- */
