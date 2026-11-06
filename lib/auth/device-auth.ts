@@ -16,6 +16,12 @@ export const DEFAULT_ENTRY_URL =
   process.env.ENTRY_URL ??
   "https://entry-agents.dev";
 
+export const BACKEND_URLS = [
+  DEFAULT_ENTRY_URL,
+  "https://entry-desktop-backend.vercel.app",
+  "https://entry-project-b.vercel.app",
+];
+
 export interface DeviceAuthorizeResponse {
   device_code: string;
   user_code: string;
@@ -46,6 +52,7 @@ export interface DeviceTokenPollResult {
 
 export class EntryDeviceAuthService {
   readonly baseUrl: string;
+  private activeBackendUrl: string;
   readonly credentialStore: OsCredentialStore;
   private currentAccount: AccountProfile | null = null;
 
@@ -54,102 +61,135 @@ export class EntryDeviceAuthService {
     credentialStore?: OsCredentialStore
   ) {
     this.baseUrl = (baseUrl || DEFAULT_ENTRY_URL).replace(/\/+$/, "");
+    this.activeBackendUrl = this.baseUrl;
     this.credentialStore = credentialStore ?? new OsCredentialStore();
   }
 
   /**
-   * Initiates the device authorization flow by calling the Entry backend on entry-agents.dev.
+   * Initiates the device authorization flow by calling the Entry backend.
+   * Gracefully tries the canonical domain followed by the deployed desktop-backend instances,
+   * while keeping browser verification strictly at https://entry-agents.dev/desktop/approve.
    */
   async startDeviceAuthorization(): Promise<DeviceAuthorizeResponse> {
-    const url = `${this.baseUrl}/api/desktop/device/start`;
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ client_id: "entry-desktop" }),
-      });
+    const candidateUrls = [
+      `${this.baseUrl}/api/desktop/device/start`,
+      "https://entry-desktop-backend.vercel.app/api/desktop/device/start",
+      "https://entry-project-b.vercel.app/api/desktop/device/start",
+    ];
 
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} from ${url}`);
+    let lastError = "Failed to connect to Entry authentication service";
+
+    for (const url of candidateUrls) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ client_id: "entry-desktop" }),
+        });
+
+        if (!res.ok) {
+          lastError = `HTTP ${res.status} from ${url}`;
+          continue;
+        }
+
+        const data = await res.json();
+        const code = data.code ?? data.user_code ?? data.userCode;
+        const deviceCode = data.device_code ?? data.deviceCode;
+
+        if (!code || !deviceCode) {
+          lastError = "Invalid response from device authorization endpoint";
+          continue;
+        }
+
+        try {
+          const parsed = new URL(url);
+          this.activeBackendUrl = parsed.origin;
+        } catch {
+          this.activeBackendUrl = this.baseUrl;
+        }
+
+        const webBase = this.baseUrl || DEFAULT_ENTRY_URL;
+        return {
+          device_code: deviceCode,
+          user_code: code,
+          code,
+          verification_uri: `${webBase}/desktop/approve`,
+          verification_uri_complete: `${webBase}/desktop/approve?code=${encodeURIComponent(code)}`,
+          expires_in: data.expires_in ?? data.expiresIn ?? 600,
+          interval: data.interval ?? data.poll_interval_seconds ?? 3,
+        };
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
       }
-
-      const data = await res.json();
-      const code = data.code ?? data.user_code ?? data.userCode;
-      const deviceCode = data.device_code ?? data.deviceCode;
-
-      if (!code || !deviceCode) {
-        throw new Error("Invalid response from device authorization endpoint");
-      }
-
-      const webBase = this.baseUrl;
-      return {
-        device_code: deviceCode,
-        user_code: code,
-        code,
-        verification_uri: data.verification_uri ?? `${webBase}/desktop/approve`,
-        verification_uri_complete:
-          data.verification_uri_complete ??
-          `${webBase}/desktop/approve?code=${encodeURIComponent(code)}`,
-        expires_in: data.expires_in ?? data.expiresIn ?? 600,
-        interval: data.interval ?? data.poll_interval_seconds ?? 3,
-      };
-    } catch (err) {
-      throw new Error(err instanceof Error ? err.message : String(err));
     }
+
+    throw new Error(lastError);
   }
 
   /**
    * Polls the device token endpoint until approved, pending, or expired.
    */
   async pollDeviceToken(deviceCode: string): Promise<DeviceTokenPollResult> {
-    const url = `${this.baseUrl}/api/desktop/device/poll`;
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          device_code: deviceCode,
-          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-          client_id: "entry-desktop",
-        }),
-      });
+    const candidateOrigins = [
+      this.activeBackendUrl,
+      this.baseUrl,
+      "https://entry-desktop-backend.vercel.app",
+      "https://entry-project-b.vercel.app",
+    ].filter(Boolean) as string[];
 
-      if (!res.ok && res.status !== 400 && res.status !== 404) {
-        return { status: "pending" };
+    const origins = Array.from(new Set(candidateOrigins));
+
+    for (const origin of origins) {
+      const url = `${origin}/api/desktop/device/poll`;
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            device_code: deviceCode,
+            grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+            client_id: "entry-desktop",
+          }),
+        });
+
+        if (!res.ok && res.status !== 400 && res.status !== 404) {
+          continue;
+        }
+
+        const data = await res.json().catch(() => ({}));
+
+        if (data.status === "expired" || data.error === "expired_token") {
+          return { status: "expired", error: "Device authorization code expired" };
+        }
+
+        if (data.status === "pending" || data.error === "authorization_pending") {
+          return { status: "pending" };
+        }
+
+        const token = data.session_token ?? data.access_token;
+        if (token && (data.status === "approved" || data.user_id)) {
+          this.activeBackendUrl = origin;
+          // Fetch real profile & balance using this session token
+          const profile = await this.fetchAccountProfile(token).catch(() => ({
+            userId: data.user_id ?? "user",
+            email: data.email ?? "user@entry-agents.dev",
+            plan: "free",
+            planName: "Entry Free",
+            creditBalanceCents: 0,
+          }));
+
+          // Save securely to OS Credential Store
+          this.saveSession(token, profile);
+
+          return {
+            status: "approved",
+            session_token: token,
+            account: profile,
+          };
+        }
+      } catch {
+        // try next endpoint
       }
-
-      const data = await res.json().catch(() => ({}));
-
-      if (data.status === "expired" || data.error === "expired_token") {
-        return { status: "expired", error: "Device authorization code expired" };
-      }
-
-      if (data.status === "pending" || data.error === "authorization_pending") {
-        return { status: "pending" };
-      }
-
-      const token = data.session_token ?? data.access_token;
-      if (token && (data.status === "approved" || data.user_id)) {
-        // Fetch real profile & balance using this session token
-        const profile = await this.fetchAccountProfile(token).catch(() => ({
-          userId: data.user_id ?? "user",
-          email: data.email ?? "user@entry-agents.dev",
-          plan: "free",
-          planName: "Entry Free",
-          creditBalanceCents: 0,
-        }));
-
-        // Save securely to OS Credential Store
-        this.saveSession(token, profile);
-
-        return {
-          status: "approved",
-          session_token: token,
-          account: profile,
-        };
-      }
-    } catch {
-      // transient network error, keep pending
     }
 
     return { status: "pending" };
@@ -159,43 +199,54 @@ export class EntryDeviceAuthService {
    * Fetches account profile and credits using Bearer session token from /api/desktop/usage.
    */
   async fetchAccountProfile(token: string): Promise<AccountProfile> {
-    const urls = [
-      `${this.baseUrl}/api/desktop/usage`,
-      `${this.baseUrl}/api/billing/me`,
-    ];
+    const candidateOrigins = [
+      this.activeBackendUrl,
+      this.baseUrl,
+      DEFAULT_ENTRY_URL,
+      "https://entry-desktop-backend.vercel.app",
+      "https://entry-project-b.vercel.app",
+    ].filter(Boolean) as string[];
 
-    for (const url of urls) {
-      try {
-        const res = await fetch(url, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: "application/json",
-          },
-        });
+    const origins = Array.from(new Set(candidateOrigins));
+    for (const origin of origins) {
+      const urls = [
+        `${origin}/api/desktop/usage`,
+        `${origin}/api/usage`,
+        `${origin}/api/billing/me`,
+      ];
+      for (const url of urls) {
+        try {
+          const res = await fetch(url, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Accept: "application/json",
+            },
+          });
 
-        if (!res.ok) continue;
+          if (!res.ok) continue;
 
-        const data = await res.json();
-        const userId = data.userId ?? data.id ?? data.user?.id ?? "entry-user";
-        const email = data.email ?? data.user?.email ?? "";
-        const name = data.name ?? data.user?.name ?? "";
-        const avatar = data.avatar ?? data.user?.avatar ?? "";
-        const plan = data.plan ?? data.planId ?? "free";
-        const planName = data.planName ?? "Entry Free";
-        const creditBalanceCents =
-          data.creditBalanceCents ?? data.balanceCents ?? data.credits ?? 0;
+          const data = await res.json();
+          const userId = data.userId ?? data.id ?? data.user?.id ?? "entry-user";
+          const email = data.email ?? data.user?.email ?? "";
+          const name = data.name ?? data.user?.name ?? "";
+          const avatar = data.avatar ?? data.user?.avatar ?? "";
+          const plan = data.plan ?? data.planId ?? "free";
+          const planName = data.planName ?? "Entry Free";
+          const creditBalanceCents =
+            data.creditBalanceCents ?? data.balanceCents ?? data.credits ?? 0;
 
-        return {
-          userId,
-          email,
-          name,
-          avatar,
-          plan,
-          planName,
-          creditBalanceCents,
-        };
-      } catch {
-        // continue
+          return {
+            userId,
+            email,
+            name,
+            avatar,
+            plan,
+            planName,
+            creditBalanceCents,
+          };
+        } catch {
+          // continue
+        }
       }
     }
 

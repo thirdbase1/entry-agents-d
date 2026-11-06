@@ -34,13 +34,13 @@ export function SignInScreen() {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0b0b0d] text-zinc-100 p-6 select-none">
       <div className="w-full max-w-md rounded-2xl border border-zinc-800 bg-[#141416] p-8 shadow-2xl flex flex-col items-center text-center">
         {/* Entry Logo */}
-        <div className="relative mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-zinc-900 border border-zinc-700/60 shadow-inner overflow-hidden">
+        <div className="relative mb-5 flex h-20 w-20 items-center justify-center drop-shadow-[0_8px_24px_rgba(0,0,0,0.7)]">
           <Image
             src="/icon.png"
             alt="Entry Agents"
-            width={48}
-            height={48}
-            className="rounded-lg object-contain"
+            width={80}
+            height={80}
+            className="h-20 w-20 object-contain rounded-2xl"
             priority
           />
         </div>

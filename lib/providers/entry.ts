@@ -413,6 +413,8 @@ export function createEntryProvider(
       const endpoints = [
         `${baseUrl}/api/desktop/models`,
         `${baseUrl}/api/models`,
+        "https://entry-desktop-backend.vercel.app/api/desktop/models",
+        "https://entry-project-b.vercel.app/api/desktop/models",
       ]
 
       for (const ep of endpoints) {

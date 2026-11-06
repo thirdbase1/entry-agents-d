@@ -1,7 +1,7 @@
 import os
 from PIL import Image
 
-src_path = r"C:\Users\HP ELITEBOOK 840 G7\.gemini\antigravity\brain\3456dcd5-5d87-42b0-baee-d95546f47395\.user_uploaded\media_1793889688248_a5dbade9.png"
+src_path = r"C:\Users\HP ELITEBOOK 840 G7\.gemini\antigravity\brain\3456dcd5-5d87-42b0-baee-d95546f47395\.user_uploaded\media_1793914613956_b143be13.jpg"
 base_dir = r"C:\Users\HP ELITEBOOK 840 G7\.gemini\antigravity\scratch\agent-ui"
 
 img = Image.open(src_path)
